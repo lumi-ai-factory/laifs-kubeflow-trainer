@@ -160,6 +160,7 @@ func toPodSetContainer(containerApply ...corev1ac.ContainerApplyConfiguration) i
 				Ports:        cApply.Ports,
 				VolumeMounts: cApply.VolumeMounts,
 			}
+
 			if !yield(container) {
 				return
 			}

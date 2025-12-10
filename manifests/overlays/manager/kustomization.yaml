@@ -6,16 +6,21 @@ namespace: kubeflow-system
 
 resources:
   - namespace.yaml
-  - ../../base/crds
+#  - ../../base/crds
   - ../../base/manager
   - ../../base/rbac
   - ../../base/webhook
-  - ../../third-party/jobset # Comment this line if JobSet is installed on the Kubernetes cluster.
+#  - ../../third-party/jobset # Comment this line if JobSet is installed on the Kubernetes cluster.
 
 # Update the Kubeflow Trainer controller manager image tag.
 images:
-  - name: ghcr.io/kubeflow/trainer/trainer-controller-manager
-    newTag: latest
+#  - name: ghcr.io/kubeflow/trainer/trainer-controller-manager
+#    newTag: latest
+
+  - name: trainer-controller
+    newName: erikaster/trainer-controller
+    newTag: remote-test
+    imagePullPolicy: Never
 
 # Secret for the Kubeflow Training webhook.
 secretGenerator:
