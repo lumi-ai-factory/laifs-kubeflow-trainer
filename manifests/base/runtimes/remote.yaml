@@ -1,0 +1,47 @@
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: ClusterTrainingRuntime
+metadata:
+  name: remote
+  labels:
+    trainer.kubeflow.org/framework: remote
+spec:
+  mlPolicy:
+    numNodes: 1
+  template:
+    spec:
+      replicatedJobs:
+        - name: node
+          template:
+            metadata:
+              labels:
+                trainer.kubeflow.org/trainjob-ancestor-step: trainer
+            spec:
+              template:
+                spec:
+                  restartPolicy: Never
+                  containers:
+                    - name: node
+                      image: ssh-trainer:latest
+                      imagePullPolicy: Never
+
+                      # SSH credentials provided via env + mounted secret
+                      env:
+                        - name: SSH_HOST
+                          value: "target_ip" # CHANGE THIS
+                        - name: SSH_USER
+                          value: "target_user" # CHANGE THIS
+                        - name: SSH_PORT
+                          value: "22"
+                        - name: SSH_KEY_PATH
+                          value: "/ssh/id_rsa"
+
+                      volumeMounts:
+                        - name: remote-ssh-key
+                          mountPath: "/ssh"
+                          readOnly: true
+
+                  volumes:
+                    - name: remote-ssh-key
+                      secret:
+                        secretName: remote-ssh-key
+                        defaultMode: 0400

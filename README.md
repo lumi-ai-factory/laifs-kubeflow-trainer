@@ -1,99 +1,62 @@
-# Kubeflow Trainer
+# Remote ClusterTrainingRuntime
 
-[![Join Slack](https://img.shields.io/badge/Join_Slack-blue?logo=slack)](https://www.kubeflow.org/docs/about/community/#kubeflow-slack-channels)
-[![Coverage Status](https://coveralls.io/repos/github/kubeflow/trainer/badge.svg?branch=master)](https://coveralls.io/github/kubeflow/trainer?branch=master)
-[![Go Report Card](https://goreportcard.com/badge/github.com/kubeflow/trainer)](https://goreportcard.com/report/github.com/kubeflow/trainer)
-[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/10435/badge)](https://www.bestpractices.dev/projects/10435)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/kubeflow/trainer)
-[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fkubeflow%2Ftrainer.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2Fkubeflow%2Ftrainer?ref=badge_shield)
+**NOTE: Work in progress**
 
-<h1 align="center">
-    <img src="./docs/images/trainer-logo.svg" alt="logo" width="200">
-  <br>
-</h1>
+This repository extends **Kubeflow Trainer** with a custom `remote` **ClusterTrainingRuntime** that executes user-defined training code on an external machine via **SSH** instead of running inside the Kubernetes cluster.
 
-Latest News 🔥
+The runtime takes the Python function passed to `CustomTrainer`, serializes it into a script, mounts it into the training container, and uses an SSH runner to upload and execute the script on a remote host.
 
-- [2025/09] Kubeflow SDK v0.1 is officially released with support for CustomTrainer,
-  BuiltinTrainer, and local PyTorch execution. Check out
-  [the GitHub release notes](https://github.com/kubeflow/sdk/releases/tag/0.1.0).
-- [2025/07] PyTorch on Kubernetes: Kubeflow Trainer Joins the PyTorch Ecosystem. Find the
-  announcement in [the PyTorch blog post](https://pytorch.org/blog/pytorch-on-kubernetes-kubeflow-trainer-joins-the-pytorch-ecosystem/).
-- [2025/07] Kubeflow Trainer v2.0 has been officially released. Check out
-  [the blog post announcement](https://blog.kubeflow.org/trainer/intro/) and [the
-  release notes](https://github.com/kubeflow/trainer/releases/tag/v2.0.0).
-- [2025/04] From High Performance Computing To AI Workloads on Kubernetes: MPI Runtime in
-  Kubeflow TrainJob. See the [KubeCon + CloudNativeCon London talk](https://youtu.be/Fnb1a5Kaxgo)
 
-## Overview
+## How It Works
 
-Kubeflow Trainer is a Kubernetes-native project designed for large language models (LLMs)
-fine-tuning and enabling scalable, distributed training of machine learning (ML) models across
-various frameworks, including PyTorch, JAX, TensorFlow, and others.
+1. User submits a `CustomTrainer(func=...)` job in a notebook.
+2. Kubeflow Trainer SDK injects the code into the `TrainJob` spec.
+3. The `remote` runtime plugin:
+   - Stores the script into a ConfigMap
+   - Mounts the script into the training container at `/app/script.py`
+   - Adds required SSH-related environment variables
+4. `ssh_runner.py` inside the container:
+   - Reads `SCRIPT_PATH`
+   - Connects to the remote host using SSH (private key from a Secret)
+   - Uploads `/app/script.py` to the remote machine
+   - Executes it with `python3`
+   - Streams stdout/stderr back to the pod logs
 
-You can integrate other ML libraries such as [HuggingFace](https://huggingface.co),
-[DeepSpeed](https://github.com/microsoft/DeepSpeed), or [Megatron-LM](https://github.com/NVIDIA/Megatron-LM)
-with Kubeflow Trainer to run them on Kubernetes.
 
-Kubeflow Trainer enables you to effortlessly develop your LLMs with the
-[Kubeflow Python SDK](https://github.com/kubeflow/sdk/), and build Kubernetes-native Training
-Runtimes using Kubernetes Custom Resource APIs.
+## Components
 
-<h1 align="center">
-    <img src="./docs/images/trainer-tech-stack.drawio.svg" alt="logo" width="500">
-  <br>
-</h1>
+| File            | Purpose                                           |
+| --------------- | ------------------------------------------------- |
+| `remote.go`     | The runtime plugin that injects script + env vars |
+| `ssh_runner.py` | SSH executor that uploads and runs the script     |
+| `Dockerfile`    | Builds the `ssh-trainer` image                    |
+| `remote.yaml`   | Defines the ClusterTrainingRuntime                |
 
-## Kubeflow Trainer Introduction
 
-The following KubeCon + CloudNativeCon 2024 talk provides an overview of Kubeflow Trainer capabilities:
+## Current state
 
-[![Kubeflow Trainer](https://img.youtube.com/vi/Lgy4ir1AhYw/0.jpg)](https://www.youtube.com/watch?v=Lgy4ir1AhYw)
+***Works***
 
-## Getting Started
+- remote code exec through Kubeflow TrainJob
 
-Please check [the official Kubeflow Trainer documentation](https://www.kubeflow.org/docs/components/trainer/getting-started)
-to install and get started with Kubeflow Trainer.
+- synchronous job execution
 
-## Community
+- capturing stdout from remote host
 
-The following links provide information on how to get involved in the community:
+***Limitations***
 
-- Join our [`#kubeflow-trainer` Slack channel](https://www.kubeflow.org/docs/about/community/#kubeflow-slack).
-- Attend [the bi-weekly AutoML and Training Working Group](https://bit.ly/2PWVCkV) community meeting.
-- Check out [who is using Kubeflow Trainer](ADOPTERS.md).
+- Not production ready
 
-## Contributing
+- Requires manual Minikube setup
 
-Please refer to the [CONTRIBUTING guide](CONTRIBUTING.md).
+- SSH host and user are hardcoded
 
-## Changelog
+- Requires local Docker build and image load
 
-Please refer to the [CHANGELOG](CHANGELOG.md).
+***Next steps:***
 
-## Kubeflow Training Operator V1
+- Use Firecrest/HeaPPE instead of SSH
 
-Kubeflow Trainer project is currently in <strong>alpha</strong> status, and APIs may change.
-If you are using Kubeflow Training Operator V1, please refer [to this migration document](https://www.kubeflow.org/docs/components/trainer/operator-guides/migration/).
+- Dynamically inject credentials instead of hardcoding them
 
-Kubeflow Community will maintain the Training Operator V1 source code at
-[the `release-1.9` branch](https://github.com/kubeflow/trainer/tree/release-1.9).
-
-You can find the documentation for Kubeflow Training Operator V1 in [these guides](https://www.kubeflow.org/docs/components/trainer/legacy-v1).
-
-## Acknowledgement
-
-This project was originally started as a distributed training operator for TensorFlow and later we
-merged efforts from other Kubeflow Training Operators to provide a unified and simplified experience
-for both users and developers. We are very grateful to all who filed issues or helped resolve them,
-asked and answered questions, and were part of inspiring discussions.
-We'd also like to thank everyone who's contributed to and maintained the original operators.
-
-- PyTorch Operator: [list of contributors](https://github.com/kubeflow/pytorch-operator/graphs/contributors)
-  and [maintainers](https://github.com/kubeflow/pytorch-operator/blob/master/OWNERS).
-- MPI Operator: [list of contributors](https://github.com/kubeflow/mpi-operator/graphs/contributors)
-  and [maintainers](https://github.com/kubeflow/mpi-operator/blob/master/OWNERS).
-- XGBoost Operator: [list of contributors](https://github.com/kubeflow/xgboost-operator/graphs/contributors)
-  and [maintainers](https://github.com/kubeflow/xgboost-operator/blob/master/OWNERS).
-- Common library: [list of contributors](https://github.com/kubeflow/common/graphs/contributors) and
-  [maintainers](https://github.com/kubeflow/common/blob/master/OWNERS).
+- Package the runtime so it can be included as a clean overlay
