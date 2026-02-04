@@ -26,6 +26,7 @@ import (
 	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/jobset"
 	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/mpi"
 	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/plainml"
+	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/remote" // new remote plugin
 	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/torch"
 	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/volcano"
 )
@@ -40,5 +41,6 @@ func NewRegistry() Registry {
 		plainml.Name:      plainml.New,
 		torch.Name:        torch.New,
 		jobset.Name:       jobset.New,
+		remote.Name:       remote.New,
 	}
 }
