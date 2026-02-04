@@ -30,6 +30,7 @@ import (
 	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/jobset"
 	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/mpi"
 	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/plainml"
+	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/remote" // new remote plugin
 	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/torch"
 	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/trainjobstatus"
 	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/volcano"
@@ -49,6 +50,7 @@ func NewRegistry() Registry {
 		jobset.Name:       jobset.New,
 		jax.Name:          jax.New,
 		xgboost.Name:      xgboost.New,
+		remote.Name:       remote.New,
 	}
 
 	if features.Enabled(features.TrainJobStatus) {
