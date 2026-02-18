@@ -9,4 +9,3 @@ COPY ./firecrest_runner.py /runner/firecrest_runner.py
 RUN chmod +x /runner/firecrest_runner.py
 
 ENTRYPOINT ["python3", "/runner/firecrest_runner.py"]
-

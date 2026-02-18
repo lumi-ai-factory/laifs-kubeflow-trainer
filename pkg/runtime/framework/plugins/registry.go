@@ -41,6 +41,6 @@ func NewRegistry() Registry {
 		plainml.Name:      plainml.New,
 		torch.Name:        torch.New,
 		jobset.Name:       jobset.New,
-		remote.Name:       remote.New,
+		remote.Name:       remote.New, // new remote plugin
 	}
 }
