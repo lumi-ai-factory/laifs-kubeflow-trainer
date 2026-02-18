@@ -17,6 +17,7 @@ package remote
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	apiruntime "k8s.io/apimachinery/pkg/runtime"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
@@ -53,6 +54,39 @@ func (r *Remote) Name() string {
 	return Name
 }
 
+func extractPythonFromHeredoc(raw string) (string, error) {
+	const marker = "EOM"
+
+	lines := strings.Split(raw, "\n")
+
+	start := -1
+	end := -1
+
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// ensimmäinen EOM-rivi (heredoc start)
+		if start == -1 && strings.HasSuffix(trimmed, marker) {
+			start = i + 1
+			continue
+		}
+
+		// toinen EOM-rivi (heredoc end)
+		if start != -1 && trimmed == marker {
+			end = i
+			break
+		}
+	}
+
+	// Jos ei löydy heredoc-rakennetta, palautetaan raw sellaisenaan
+	if start == -1 || end == -1 || end <= start {
+		return raw, nil
+	}
+
+	pythonLines := lines[start:end]
+	return strings.Join(pythonLines, "\n"), nil
+}
+
 // Build is invoked by the Trainer runtime during reconciliation.
 // It extracts the inline training script, persists it as a ConfigMap,
 // and mutates the JobSet apply-configuration so that the trainer pod
@@ -77,8 +111,12 @@ func (r *Remote) Build(
 	}
 
 	// Extract inline script from SDK
-	script := job.Spec.Trainer.Command[2]
-	job.Spec.Trainer.Command = nil
+	raw := job.Spec.Trainer.Command[2]
+
+	script, err := extractPythonFromHeredoc(raw)
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract python from heredoc: %w", err)
+	}
 
 	cmName := fmt.Sprintf("%s-remote-script", job.Name)
 
