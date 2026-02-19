@@ -54,31 +54,36 @@ func (r *Remote) Name() string {
 	return Name
 }
 
+// extractPythonFromHeredoc extracts Python code from the Trainer SDK
+// heredoc wrapper:
+//
+//	read -r -d '' SCRIPT << EOM
+//	...
+//	EOM
+//
+// If no heredoc markers are found, the input is returned as-is.
 func extractPythonFromHeredoc(raw string) (string, error) {
+
 	const marker = "EOM"
 
 	lines := strings.Split(raw, "\n")
-
 	start := -1
 	end := -1
 
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
 
-		// ensimmäinen EOM-rivi (heredoc start)
 		if start == -1 && strings.HasSuffix(trimmed, marker) {
 			start = i + 1
 			continue
 		}
 
-		// toinen EOM-rivi (heredoc end)
 		if start != -1 && trimmed == marker {
 			end = i
 			break
 		}
 	}
 
-	// Jos ei löydy heredoc-rakennetta, palautetaan raw sellaisenaan
 	if start == -1 || end == -1 || end <= start {
 		return raw, nil
 	}
@@ -87,17 +92,17 @@ func extractPythonFromHeredoc(raw string) (string, error) {
 	return strings.Join(pythonLines, "\n"), nil
 }
 
-// Build is invoked by the Trainer runtime during reconciliation.
-// It extracts the inline training script, persists it as a ConfigMap,
-// and mutates the JobSet apply-configuration so that the trainer pod
-// executes a remote runner instead of running training in-cluster.
+// Build customizes the generated JobSet so that training is executed
+// outside Kubernetes by these step:
+//  1. extracts the inline Python script produced by the Trainer SDK
+//  2. stores it in a ConfigMap
+//  3. rewrites the trainer container to run the remote FirecREST runner,
+//     which submits and monitors the job on the HPC system
 func (r *Remote) Build(
 	ctx context.Context,
 	info *runtime.Info,
 	job *trainer.TrainJob,
 ) ([]apiruntime.ApplyConfiguration, error) {
-
-	fmt.Println("REMOTE PLUGIN VERSION 3")
 
 	if info == nil || job == nil || job.Spec.Trainer == nil {
 		return nil, nil
@@ -110,7 +115,7 @@ func (r *Remote) Build(
 		)
 	}
 
-	// Extract inline script from SDK
+	// Extract Python code from the SDK-generated heredoc wrapper
 	raw := job.Spec.Trainer.Command[2]
 
 	script, err := extractPythonFromHeredoc(raw)
@@ -125,7 +130,7 @@ func (r *Remote) Build(
 			ScriptKey: script,
 		})
 
-	// Get JobSet apply object (this is the real template)
+	// Access the underlying JobSet apply configuration (actual pod template)
 	jobSetSpec, ok := runtime.TemplateSpecApply[jobsetv1alpha2ac.JobSetSpecApplyConfiguration](info)
 	if !ok {
 		return nil, fmt.Errorf("remote-runtime: expected JobSet template")
@@ -160,30 +165,35 @@ func (r *Remote) Build(
 				c.Command = []string{"python3", "/runner/firecrest_runner.py"}
 				c.Args = nil
 
-				// Mount script volume
+				// Mount ConfigMap containing extracted script
 				c.VolumeMounts = append(c.VolumeMounts,
 					*corev1ac.VolumeMount().
 						WithName(ScriptVolumeName).
 						WithMountPath(ScriptMountDir),
 				)
 
-				// Inject SCRIPT_PATH
+				// Pass script location to the runner via env
 				c.Env = append(c.Env,
 					*corev1ac.EnvVar().
 						WithName("SCRIPT_PATH").
 						WithValue(ScriptFilePath),
 				)
 
-				// Optional SLURM_URI
+				// Pass SLURM script path via annotation
+				slurmURI := ""
 				if job.Annotations != nil {
-					if slurmURI := job.Annotations[SlurmURIAnnotation]; slurmURI != "" {
-						c.Env = append(c.Env,
-							*corev1ac.EnvVar().
-								WithName("SLURM_URI").
-								WithValue(slurmURI),
-						)
-					}
+					slurmURI = strings.TrimSpace(job.Annotations[SlurmURIAnnotation])
 				}
+
+				if slurmURI == "" {
+					return nil, fmt.Errorf("remote-runtime: required annotation %q is missing", SlurmURIAnnotation)
+				}
+
+				c.Env = append(c.Env,
+					*corev1ac.EnvVar().
+						WithName("SLURM_URI").
+						WithValue(slurmURI),
+				)
 			}
 		}
 	}

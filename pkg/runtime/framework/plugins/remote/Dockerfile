@@ -1,7 +1,12 @@
-# This container does NOT contain ML frameworks — it only executes code remotely via FirecREST.
+# -----------------------------------------------------------------------------
+# Remote trainer runtime image
+# Executes training scripts remotely via FirecREST + SLURM.
+# Does NOT run ML training locally.
+# -----------------------------------------------------------------------------
+
 FROM python:3.11-slim
 
-# FirecREST Python client
+# FirecREST Python client for remote execution
 RUN pip install --no-cache-dir pyfirecrest boto3
 
 WORKDIR /runner

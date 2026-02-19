@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """
-FirecREST runner: executes an inline user script on a remote SLURM system.
+FirecREST runner.
 
-Requires:
-  - SCRIPT_PATH: path to mounted user script (ConfigMap)
-  - SLURM_URI:   s3://bucket/key to the SLURM script (mandatory)
-  - FirecREST OAuth + endpoint config via env (client_id, client_secret, token_uri, firecrest_url)
-  - machine, remote_path, (optional) account
+Executes a user-provided Python script on a remote SLURM cluster:
+- Downloads SLURM submission script from S3 (SLURM_URI)
+- Uploads user script + SLURM script to remote_path
+- Submits job via FirecREST
+- Waits for completion and prints remote logs
 
-For S3 download (SLURM_URI):
-  - AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (or compatible envs)
-  - optionally AWS_SESSION_TOKEN
-  - optionally S3_ENDPOINT_URL (e.g. Allas) and S3_REGION
+Fails fast on missing configuration.
 """
 import os
 import sys
@@ -22,14 +19,6 @@ from pathlib import Path
 import firecrest as fc
 import boto3
 
-TERMINAL_STATES = {
-    "COMPLETED",
-    "FAILED",
-    "CANCELLED",
-    "TIMEOUT",
-    "OUT_OF_MEMORY",
-}
-
 
 def require_env(name: str) -> str:
     """Fetch required environment variable or fail fast with a clear message."""
@@ -39,6 +28,20 @@ def require_env(name: str) -> str:
         sys.exit(1)
     return v.strip()
 
+def collect_s3_env():
+    keys = [
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "S3_ENDPOINT_URL",
+        "S3_REGION",]
+    env_vars = {}
+    for key in keys:
+        value = os.environ.get(key)
+        if not value:
+            print(f"ERROR: missing required S3 env var '{key}'", file=sys.stderr)
+            sys.exit(1)
+        env_vars[key] = value.strip()
+    return env_vars
 
 def download_slurm_from_s3(slurm_uri: str, dst_path: Path) -> None:
     if not slurm_uri.startswith("s3://"):
@@ -51,12 +54,12 @@ def download_slurm_from_s3(slurm_uri: str, dst_path: Path) -> None:
     bucket, key = no_scheme.split("/", 1)
 
     endpoint_url = os.environ.get("S3_ENDPOINT_URL")
-    region = os.environ.get("S3_REGION")
+    region_name = os.environ.get("S3_REGION")
 
     s3 = boto3.client(
         "s3",
         endpoint_url=endpoint_url,
-        region_name=region,
+        region_name=region_name,
     )
 
     obj = s3.get_object(Bucket=bucket, Key=key)
@@ -69,8 +72,7 @@ def download_slurm_from_s3(slurm_uri: str, dst_path: Path) -> None:
 
 def main():
 
-    # --- Inputs and configuration ------------------------------------------------
-    # 1) Path to the user script inside the pod (mounted from ConfigMap/volume).
+    # --- Inputs and configuration ---
     script_path = require_env("SCRIPT_PATH")
     if not os.path.exists(script_path):
         print(f"ERROR: Script not found at {script_path}",
@@ -86,7 +88,6 @@ def main():
         )
         sys.exit(1)
 
-    # 2) FirecREST client configuration (typically injected via Kubernetes Secret).
     client_id = require_env("client_id")
     client_secret = require_env("client_secret")
     token_uri = require_env("token_uri")
@@ -95,61 +96,80 @@ def main():
     remote_path = require_env("remote_path")
     account = os.environ.get("account", "").strip() or None
 
-    # --- Prepare payload: user script + download SLURM submission script from LUMI-O --------
-    # Read the inline user code and stage files into a local temp directory.
+    # --- Prepare payload: user script + download SLURM submission script + from LUMI-O + .env with AWS secrets ---
     with open(script_path, "r") as f:
         user_code = f.read()
 
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
 
+        s3_env = collect_s3_env()
+
         local_py = td / "script.py"
         local_slurm = td / "job.slurm"
+        local_env = td / ".env"
 
         local_py.write_text(user_code, encoding="utf-8")
+
+        lines = [f"export {k}='{v}'" for k, v in s3_env.items()]
+        local_env.write_text("\n".join(lines))
 
         print(f"Downloading SLURM script from {slurm_uri} ...")
         download_slurm_from_s3(slurm_uri, local_slurm)
         print("Download OK.")
 
-        # --- FirecREST client setup ------------------------------------------------
-        # Use OAuth client-credentials flow to obtain tokens for FirecREST requests.
+        # --- FirecREST client setup ---
         auth = fc.ClientCredentialsAuth(client_id, client_secret, token_uri)
         client = fc.v2.Firecrest(firecrest_url=firecrest_url, authorization=auth)
 
-        # --- Upload files to the remote working directory --------------------------
-        # Upload both the user script and the SLURM job script to remote_path.
-        # blocking=True ensures we don't submit before upload finishes.
-        print(f"Uploading script.py and job.slurm to {machine}:{remote_path} ...")
+        # --- Create folder for
+        run_id = str(int(time.time()))
+        job_dir = f"{remote_path}/{run_id}"
+
+        client.mkdir(machine, job_dir)
+
+        # --- Upload files to the remote working directory ---
+        print(f"Uploading script.py, job.slurm and .env to {machine}:{job_dir} ...")
         client.upload(
             system_name=machine,
             local_file=str(local_py),
-            directory=remote_path,
+            directory=job_dir,
             filename="script.py",
             account=account,
             blocking=True,
         )
+        print("Uploaded script.py")
         client.upload(
             system_name=machine,
             local_file=str(local_slurm),
-            directory=remote_path,
+            directory=job_dir,
             filename="job.slurm",
             account=account,
             blocking=True,
         )
+        print("Uploaded job.slurm")
+        client.upload(
+            system_name=machine,
+            local_file=str(local_env),
+            directory=job_dir,
+            filename=".env",
+            account=account,
+            blocking=True,
+        )
+        print("Uploaded .env")
+
         print("Upload OK.")
 
-        # --- Submit SLURM job ------------------------------------------------------
-        # Submit the job script from remote_path and extract the job id from response.
-        remote_slurm_path = f"{remote_path}/job.slurm"
+        # --- Submit SLURM job ---
+        remote_slurm_path = f"{job_dir}/job.slurm"
         print(f"Submitting job: {remote_slurm_path}")
         job = client.submit(
             machine,
-            working_dir=remote_path,
+            working_dir=job_dir,
             script_remote_path=remote_slurm_path,
             account=account,
         )
-        # FirecREST submit response is typically dict-like; accept common jobid keys.
+
         jobid = None
         if isinstance(job, dict):
             jobid = job.get("jobid") or job.get("jobId") or job.get("job_id")
@@ -160,7 +180,7 @@ def main():
         print(f"Submitted jobid={jobid}")
         print("Raw submit response:", job)
 
-        # --- Poll for completion ---------------------------------------------------
+        # --- Poll for completion ---
         print("Waiting for job to finish...")
         result = client.wait_for_job(machine, jobid)
         print("wait_for_job result:", result)
@@ -178,9 +198,9 @@ def main():
         print(f"Job {jobid} completed successfully.")
 
 
-        # ---- FETCH LOGS ----
-        out_file = f"{remote_path}/firecrest-{jobid}.out"
-        err_file = f"{remote_path}/firecrest-{jobid}.err"
+        # ---- Fetch logs ---- // WIP
+        out_file = f"{job_dir}/firecrest-{jobid}.out"
+        err_file = f"{job_dir}/firecrest-{jobid}.err"
 
         print("\n--- REMOTE STDOUT ---")
         try:
@@ -196,31 +216,6 @@ def main():
 
         print("Remote job completed successfully.")
         sys.exit(0)
-
-"""
-        # --- Fetch logs (best-effort) ----------------------------------------------
-        # Attempt to print remote stdout/stderr to pod logs for user visibility.
-        out_file = f"{remote_path}/firecrest-{jobid}.out"
-        err_file = f"{remote_path}/firecrest-{jobid}.err"
-
-        print("\n--- BEGIN REMOTE STDOUT ---")
-        try:
-            print(client.view(machine, out_file))
-        except Exception as e:
-            print(f"(Could not view stdout file {out_file}: {e})", file=sys.stderr)
-        print("--- END REMOTE STDOUT ---\n")
-
-        print("\n--- BEGIN REMOTE STDERR ---", file=sys.stderr)
-        try:
-            print(client.view(machine, err_file), file=sys.stderr)
-        except Exception as e:
-            print(f"(Could not view stderr file {err_file}: {e})", file=sys.stderr)
-        print("--- END REMOTE STDERR ---\n", file=sys.stderr)
-
-        print(f"Submitted job {jobid}. Not waiting for completion.")
-        sys.exit(0)
-
-"""
 
 if __name__ == "__main__":
     main()

@@ -1,10 +1,18 @@
+# -----------------------------------------------------------------------------
+# ClusterTrainingRuntime "remote"
+# Runs Trainer jobs outside Kubernetes via FirecREST.
+# The actual execution is handled by the remote-trainer image (ENTRYPOINT).
+# -----------------------------------------------------------------------------
+
 apiVersion: trainer.kubeflow.org/v1alpha1
 kind: ClusterTrainingRuntime
 metadata:
   name: remote
   labels:
+    # Custom runtime framework identifier
     trainer.kubeflow.org/framework: remote
 spec:
+  # Single-node runtime (HPC side controls actual allocation)
   mlPolicy:
     numNodes: 1
   template:
@@ -13,6 +21,7 @@ spec:
         - name: node
           template:
             metadata:
+              # Required so Trainer identifies this as the training step
               labels:
                 trainer.kubeflow.org/trainjob-ancestor-step: trainer
             spec:
@@ -21,9 +30,10 @@ spec:
                   restartPolicy: Never
                   containers:
                     - name: node
+                      # Lightweight runner image that submits to HPC via FirecREST
                       image: remote-trainer:latest
                       imagePullPolicy: Never
-                      command: []
+                      # Credentials for S3 + FirecREST
                       envFrom:
                         - secretRef:
                             name: aws-secret
