@@ -12,11 +12,14 @@ Fails fast on missing configuration.
 """
 import os
 import sys
+from datetime import datetime
 import time
+import uuid
 import tempfile
 from pathlib import Path
 
 import firecrest as fc
+from firecrest import FirecrestException
 import boto3
 
 
@@ -122,10 +125,21 @@ def main():
         auth = fc.ClientCredentialsAuth(client_id, client_secret, token_uri)
         client = fc.v2.Firecrest(firecrest_url=firecrest_url, authorization=auth)
 
-        # --- Create folder for
-        run_id = str(int(time.time()))
-        job_dir = f"{remote_path}/{run_id}"
+        # --- Create folder for logs
 
+        now = datetime.now()
+
+        date_dir = now.strftime("%Y-%m-%d")
+        day_path = f"{remote_path}/{date_dir}"
+
+        run_id = now.strftime("%H-%M-%S") + "_" + uuid.uuid4().hex[:6]
+        job_dir = f"{day_path}/{run_id}"
+
+        try:
+            client.mkdir(machine, day_path)
+        except FirecrestException as e:
+            if "File exists" not in str(e) and e.status_code != 409:
+                raise
         client.mkdir(machine, job_dir)
 
         # --- Upload files to the remote working directory ---
@@ -197,8 +211,7 @@ def main():
 
         print(f"Job {jobid} completed successfully.")
 
-
-        # ---- Fetch logs ---- // WIP
+        # ---- Fetch logs ----
         out_file = f"{job_dir}/firecrest-{jobid}.out"
         err_file = f"{job_dir}/firecrest-{jobid}.err"
 
