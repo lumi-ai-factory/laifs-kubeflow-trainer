@@ -31,8 +31,8 @@ spec:
                   containers:
                     - name: node
                       # Lightweight runner image that submits to HPC via FirecREST
-                      image: remote-trainer:latest
-                      imagePullPolicy: Never
+                      image: image-registry.apps.devel-5.okd4.csc.fi/kf-trainer-images/firecrest-runner-lumi:v1
+                      imagePullPolicy: Always
                       # Credentials for S3 + FirecREST
                       envFrom:
                         - secretRef:
