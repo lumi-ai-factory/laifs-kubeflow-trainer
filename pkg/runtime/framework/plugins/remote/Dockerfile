@@ -10,7 +10,8 @@ FROM python:3.11-slim
 RUN pip install --no-cache-dir pyfirecrest boto3
 
 WORKDIR /runner
-COPY ./firecrest_runner.py /runner/firecrest_runner.py
-RUN chmod +x /runner/firecrest_runner.py
+#COPY ./firecrest_runner.py /runner/firecrest_runner.py
+COPY ../firecrest_runner.py firecrest_runner.py
+RUN chmod +x firecrest_runner.py
 
-ENTRYPOINT ["python3", "/runner/firecrest_runner.py"]
+ENTRYPOINT ["python3", "./firecrest_runner.py"]
