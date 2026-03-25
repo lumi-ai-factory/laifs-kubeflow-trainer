@@ -28,6 +28,8 @@ import (
 	"github.com/kubeflow/trainer/v2/pkg/runtime/framework"
 
 	jobsetv1alpha2ac "sigs.k8s.io/jobset/client-go/applyconfiguration/jobset/v1alpha2"
+
+	configapi "github.com/kubeflow/trainer/v2/pkg/apis/config/v1alpha1"
 )
 
 const (
@@ -46,7 +48,7 @@ type Remote struct {
 
 var _ framework.ComponentBuilderPlugin = (*Remote)(nil)
 
-func New(_ context.Context, c client.Client, _ client.FieldIndexer) (framework.Plugin, error) {
+func New(_ context.Context, c client.Client, _ client.FieldIndexer, cfg *configapi.Configuration) (framework.Plugin, error) {
 	return &Remote{client: c}, nil
 }
 

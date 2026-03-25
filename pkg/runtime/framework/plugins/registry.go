@@ -51,8 +51,6 @@ func NewRegistry() Registry {
 		jax.Name:          jax.New,
 		xgboost.Name:      xgboost.New,
 		remote.Name:       remote.New, // new remote plugin
-		jax.Name:          jax.New,
-		xgboost.Name:      xgboost.New,
 	}
 
 	if features.Enabled(features.TrainJobStatus) {
