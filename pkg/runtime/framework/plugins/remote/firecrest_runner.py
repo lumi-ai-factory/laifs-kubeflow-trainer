@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 FirecREST runner.
@@ -22,6 +23,12 @@ import firecrest as fc
 from firecrest import FirecrestException
 import boto3
 
+class StaticTokenAuth:
+    def __init__(self, token: str):
+        self._token = token
+
+    def get_access_token(self) -> str:
+        return self._token
 
 def require_env(name: str) -> str:
     """Fetch required environment variable or fail fast with a clear message."""
@@ -31,12 +38,40 @@ def require_env(name: str) -> str:
         sys.exit(1)
     return v.strip()
 
+def collect_firecrest_env():
+    keys = [
+        "FIRECREST_URL", #
+        "FIRECREST_TOKEN", #
+        "FIRECREST_MACHINE",
+        "FIRECREST_REMOTE_PATH", # path to your home or project scratch directory for SLURM OUTPUTS
+        "FIRECREST_REMOTE_FILE_PATH",
+        "FIRECREST_ACCOUNT", # your LUMI project as 'project_xxxxxxxxxx'
+        ]
+    env_vars = {}
+    for key in keys:
+        value = os.environ.get(key)
+        if not value:
+            print(f"ERROR: missing required FirecREST env var '{key}'", file=sys.stderr)
+            sys.exit(1)
+        env_vars[key] = value.strip()
+    return env_vars
+
+def create_firecrest_client(fc_env):
+    auth = StaticTokenAuth(fc_env["FIRECREST_TOKEN"])
+    client = fc.v2.Firecrest(
+        firecrest_url=fc_env["FIRECREST_URL"],
+        authorization=auth,
+        verify=True,
+    )
+    return client
+
 def collect_s3_env():
     keys = [
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
         "S3_ENDPOINT_URL",
-        "S3_REGION",]
+        "S3_REGION",
+        ]
     env_vars = {}
     for key in keys:
         value = os.environ.get(key)
@@ -91,13 +126,12 @@ def main():
         )
         sys.exit(1)
 
-    client_id = require_env("client_id")
-    client_secret = require_env("client_secret")
-    token_uri = require_env("token_uri")
-    firecrest_url = require_env("firecrest_url")
-    machine = require_env("machine")
-    remote_path = require_env("remote_path")
-    account = os.environ.get("account", "").strip() or None
+    fc_env = collect_firecrest_env()
+    client = create_firecrest_client(fc_env)
+
+    machine = fc_env["FIRECREST_MACHINE"]
+    remote_path = fc_env["FIRECREST_REMOTE_PATH"]
+    account = fc_env["FIRECREST_ACCOUNT"]
 
     # --- Prepare payload: user script + download SLURM submission script + from LUMI-O + .env with AWS secrets ---
     with open(script_path, "r") as f:
@@ -121,16 +155,12 @@ def main():
         download_slurm_from_s3(slurm_uri, local_slurm)
         print("Download OK.")
 
-        # --- FirecREST client setup ---
-        auth = fc.ClientCredentialsAuth(client_id, client_secret, token_uri)
-        client = fc.v2.Firecrest(firecrest_url=firecrest_url, authorization=auth)
-
         # --- Create folder for logs
 
         now = datetime.now()
 
         date_dir = now.strftime("%Y-%m-%d")
-        day_path = f"{remote_path}/{date_dir}"
+        day_path = f"{remote_path}/kf_output/{date_dir}"
 
         run_id = now.strftime("%H-%M-%S") + "_" + uuid.uuid4().hex[:6]
         job_dir = f"{day_path}/{run_id}"
