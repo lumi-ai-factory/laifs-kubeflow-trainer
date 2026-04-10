@@ -166,9 +166,9 @@ def main():
         job_dir = f"{day_path}/{run_id}"
 
         try:
-            client.mkdir(machine, day_path)
+            client.mkdir(machine, job_dir, create_parents=True)
         except FirecrestException as e:
-            if "File exists" not in str(e) and e.status_code != 409:
+            if "File exists" not in str(e):
                 raise
         client.mkdir(machine, job_dir)
 
