@@ -170,7 +170,6 @@ def main():
         except FirecrestException as e:
             if "File exists" not in str(e):
                 raise
-        client.mkdir(machine, job_dir)
 
         # --- Upload files to the remote working directory ---
         print(f"Uploading script.py, job.slurm and .env to {machine}:{job_dir} ...")
