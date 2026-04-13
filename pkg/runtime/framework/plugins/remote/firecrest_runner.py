@@ -81,23 +81,20 @@ def collect_s3_env():
         env_vars[key] = value.strip()
     return env_vars
 
-def download_slurm_from_s3(slurm_uri: str, dst_path: Path) -> None:
-    if not slurm_uri.startswith("s3://"):
-        raise ValueError(f"Unsupported SLURM_URI: {slurm_uri}")
+def download_from_s3(uri: str, dst_path: Path) -> None:
+    if not uri.startswith("s3://"):
+        raise ValueError(f"Unsupported S3 URI: {uri}")
 
-    no_scheme = slurm_uri[len("s3://"):]
+    no_scheme = uri[len("s3://"):]
     if "/" not in no_scheme:
-        raise ValueError(f"Invalid S3 URI (missing key): {slurm_uri}")
+        raise ValueError(f"Invalid S3 URI (missing key): {uri}")
 
     bucket, key = no_scheme.split("/", 1)
 
-    endpoint_url = os.environ.get("S3_ENDPOINT_URL")
-    region_name = os.environ.get("S3_REGION")
-
     s3 = boto3.client(
         "s3",
-        endpoint_url=endpoint_url,
-        region_name=region_name,
+        endpoint_url=os.environ.get("S3_ENDPOINT_URL"),
+        region_name=os.environ.get("S3_REGION"),
     )
 
     obj = s3.get_object(Bucket=bucket, Key=key)
@@ -105,18 +102,12 @@ def download_slurm_from_s3(slurm_uri: str, dst_path: Path) -> None:
     dst_path.write_bytes(body)
 
     if dst_path.stat().st_size == 0:
-        raise RuntimeError("Downloaded SLURM script is empty.")
+        raise RuntimeError(f"Downloaded file from {uri} is empty.")
 
 
 def main():
 
     # --- Inputs and configuration ---
-    script_path = require_env("SCRIPT_PATH")
-    if not os.path.exists(script_path):
-        print(f"ERROR: Script not found at {script_path}",
-        file=sys.stderr,
-        )
-        sys.exit(1)
 
     slurm_uri = require_env("SLURM_URI")
     if not slurm_uri.startswith("s3://"):
@@ -134,8 +125,6 @@ def main():
     account = fc_env["FIRECREST_ACCOUNT"]
 
     # --- Prepare payload: user script + download SLURM submission script + from LUMI-O + .env with AWS secrets ---
-    with open(script_path, "r") as f:
-        user_code = f.read()
 
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
@@ -146,13 +135,37 @@ def main():
         local_slurm = td / "job.slurm"
         local_env = td / ".env"
 
-        local_py.write_text(user_code, encoding="utf-8")
+        # --- SCRIPT ---
+        script_uri = os.environ.get("SCRIPT_URI")
+        script_path = os.environ.get("SCRIPT_PATH")
 
+        if script_uri and script_path:
+            print("ERROR: both SCRIPT_URI and SCRIPT_PATH provided, ambiguous", file=sys.stderr)
+            sys.exit(1)
+        if not script_uri and not script_path:
+            print("ERROR: neither SCRIPT_URI nor SCRIPT_PATH provided", file=sys.stderr)
+            sys.exit(1)
+
+        if script_uri:
+            print(f"Downloading user script from {script_uri} ...")
+            download_from_s3(script_uri, local_py)
+            print("Download OK.")
+        else:
+            if not os.path.exists(script_path):
+                print(f"ERROR: Script not found at {script_path}", file=sys.stderr)
+                sys.exit(1)
+
+            with open(script_path, "r") as f:
+                local_py.write_text(f.read(), encoding="utf-8")
+
+
+        # --- ENV ---
         lines = [f"export {k}='{v}'" for k, v in s3_env.items()]
         local_env.write_text("\n".join(lines))
 
+        # --- SLURM ---
         print(f"Downloading SLURM script from {slurm_uri} ...")
-        download_slurm_from_s3(slurm_uri, local_slurm)
+        download_from_s3(slurm_uri, local_slurm)
         print("Download OK.")
 
         # --- Create folder for logs
@@ -206,6 +219,11 @@ def main():
         # --- Submit SLURM job ---
         remote_slurm_path = f"{job_dir}/job.slurm"
         print(f"Submitting job: {remote_slurm_path}")
+
+        ### DEBUG PRINTS
+        print(f"Using SCRIPT_PATH={os.environ.get('SCRIPT_PATH')}")
+        print(f"Using SCRIPT_URI={os.environ.get('SCRIPT_URI')}")
+
         job = client.submit(
             machine,
             working_dir=job_dir,

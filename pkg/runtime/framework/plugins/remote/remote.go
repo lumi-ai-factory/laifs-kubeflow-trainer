@@ -36,6 +36,7 @@ const (
 	Name               = "remote"
 	ScriptKey          = "script.py"
 	SlurmURIAnnotation = "remote.trainer.kubeflow.org/slurm-uri"
+	ScriptURIAnnotation = "remote.trainer.kubeflow.org/script-uri"
 
 	ScriptVolumeName = "remote-script"
 	ScriptMountDir   = "/mnt/remote"
@@ -196,6 +197,20 @@ func (r *Remote) Build(
 						WithName("SLURM_URI").
 						WithValue(slurmURI),
 				)
+
+				// Pass script path via annotation
+				scriptURI := ""
+				if job.Annotations != nil {
+					scriptURI = strings.TrimSpace(job.Annotations[ScriptURIAnnotation])
+				}
+
+				if scriptURI != "" {
+					c.Env = append(c.Env,
+						*corev1ac.EnvVar().
+							WithName("SCRIPT_URI").
+							WithValue(scriptURI),
+					)
+				}
 			}
 		}
 	}
