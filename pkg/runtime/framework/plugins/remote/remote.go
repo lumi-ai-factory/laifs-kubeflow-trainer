@@ -201,7 +201,7 @@ func (r *Remote) Build(
 				scriptURI := strings.TrimSpace(job.Annotations[ScriptURIAnnotation])
 
 				if scriptURI != "" {
-					var newEnv []corev1.EnvVar
+					var newEnv []corev1ac.EnvVar
 					for _, e := range c.Env {
 						if e.Name == "SCRIPT_PATH" {
 							continue
