@@ -240,11 +240,12 @@ func (r *Remote) Build(
 							WithName("SCRIPT_URI").
 							WithValue(scriptURI),
 					)
-				}
+				}*/
+
 			}
 		}
 	}
-	*/
+
 
 	return []apiruntime.ApplyConfiguration{cm}, nil
 }
