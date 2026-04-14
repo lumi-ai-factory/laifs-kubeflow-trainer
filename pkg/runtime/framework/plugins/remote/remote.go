@@ -210,8 +210,7 @@ func (r *Remote) Build(
 					}
 					c.Env = newEnv
 					c.Env = upsertEnvVar(c.Env, "SCRIPT_URI", scriptURI)
-				}
-				else {
+				} else {
 					c.Env = upsertEnvVar(c.Env, "SCRIPT_PATH", ScriptFilePath)
 				}
 
