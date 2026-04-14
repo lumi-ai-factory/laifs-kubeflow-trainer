@@ -95,6 +95,20 @@ func extractPythonFromHeredoc(raw string) (string, error) {
 	return strings.Join(pythonLines, "\n"), nil
 }
 
+func upsertEnvVar(env []corev1ac.EnvVarApplyConfiguration, name, value string) []corev1ac.EnvVarApplyConfiguration {
+	for i := range env {
+		if env[i].Name != nil && *env[i].Name == name {
+			env[i].Value = &value
+			return env
+		}
+	}
+	return append(env,
+		*corev1ac.EnvVar().
+			WithName(name).
+			WithValue(value),
+	)
+}
+
 // Build customizes the generated JobSet so that training is executed
 // outside Kubernetes by these step:
 //  1. extracts the inline Python script produced by the Trainer SDK
@@ -175,6 +189,22 @@ func (r *Remote) Build(
 						WithMountPath(ScriptMountDir),
 				)
 
+				// SCRIPT_PATH (always)
+				c.Env = upsertEnvVar(c.Env, "SCRIPT_PATH", ScriptFilePath)
+
+				// SLURM_URI (required)
+				slurmURI := strings.TrimSpace(job.Annotations[SlurmURIAnnotation])
+				if slurmURI == "" {
+					return nil, fmt.Errorf("remote-runtime: required annotation %q is missing", SlurmURIAnnotation)
+				}
+				c.Env = upsertEnvVar(c.Env, "SLURM_URI", slurmURI)
+
+				// SCRIPT_URI (optional)
+				scriptURI := strings.TrimSpace(job.Annotations[ScriptURIAnnotation])
+				if scriptURI != "" {
+					c.Env = upsertEnvVar(c.Env, "SCRIPT_URI", scriptURI)
+				}
+/*
 				// Pass script location to the runner via env
 				c.Env = append(c.Env,
 					*corev1ac.EnvVar().
@@ -214,6 +244,7 @@ func (r *Remote) Build(
 			}
 		}
 	}
+	*/
 
 	return []apiruntime.ApplyConfiguration{cm}, nil
 }
