@@ -176,7 +176,8 @@ func (r *Remote) Build(
 		for j := range rJob.Template.Spec.Template.Spec.Containers {
 			c := &rJob.Template.Spec.Template.Spec.Containers[j]
 
-			if c.Name != nil && *c.Name == "node" {
+			// if c.Name != nil && *c.Name == "node" {
+			if c.Name != nil {
 
 				// Force remote runner
 				c.Command = []string{"python3", "/runner/firecrest_runner.py"}
