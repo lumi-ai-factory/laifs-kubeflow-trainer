@@ -139,9 +139,6 @@ def main():
         script_uri = os.environ.get("SCRIPT_URI")
         script_path = os.environ.get("SCRIPT_PATH")
 
-        if script_uri and script_path:
-            print("ERROR: both SCRIPT_URI and SCRIPT_PATH provided, ambiguous", file=sys.stderr)
-            sys.exit(1)
         if not script_uri and not script_path:
             print("ERROR: neither SCRIPT_URI nor SCRIPT_PATH provided", file=sys.stderr)
             sys.exit(1)

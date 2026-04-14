@@ -190,9 +190,6 @@ func (r *Remote) Build(
 						WithMountPath(ScriptMountDir),
 				)
 
-				// SCRIPT_PATH (always)
-				c.Env = upsertEnvVar(c.Env, "SCRIPT_PATH", ScriptFilePath)
-
 				// SLURM_URI (required)
 				slurmURI := strings.TrimSpace(job.Annotations[SlurmURIAnnotation])
 				if slurmURI == "" {
@@ -200,10 +197,22 @@ func (r *Remote) Build(
 				}
 				c.Env = upsertEnvVar(c.Env, "SLURM_URI", slurmURI)
 
-				// SCRIPT_URI (optional)
+				// SCRIPT_URI (optional, overrides SCRIPT_PATH)
 				scriptURI := strings.TrimSpace(job.Annotations[ScriptURIAnnotation])
+
 				if scriptURI != "" {
+					var newEnv []corev1.EnvVar
+					for _, e := range c.Env {
+						if e.Name == "SCRIPT_PATH" {
+							continue
+						}
+						newEnv = append(newEnv, e)
+					}
+					c.Env = newEnv
 					c.Env = upsertEnvVar(c.Env, "SCRIPT_URI", scriptURI)
+				}
+				else {
+					c.Env = upsertEnvVar(c.Env, "SCRIPT_PATH", ScriptFilePath)
 				}
 
 				// DEBUG
