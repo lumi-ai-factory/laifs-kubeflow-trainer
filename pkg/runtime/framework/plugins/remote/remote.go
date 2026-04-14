@@ -204,6 +204,12 @@ func (r *Remote) Build(
 				if scriptURI != "" {
 					c.Env = upsertEnvVar(c.Env, "SCRIPT_URI", scriptURI)
 				}
+
+				// DEBUG
+				fmt.Printf("DEBUG annotations: %+v\n", job.Annotations)
+
+				val, ok := job.Annotations[ScriptURIAnnotation]
+				fmt.Printf("DEBUG script-uri found=%v value='%s'\n", ok, val)
 /*
 				// Pass script location to the runner via env
 				c.Env = append(c.Env,
