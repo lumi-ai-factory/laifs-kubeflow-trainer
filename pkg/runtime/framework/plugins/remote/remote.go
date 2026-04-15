@@ -176,8 +176,7 @@ func (r *Remote) Build(
 		for j := range rJob.Template.Spec.Template.Spec.Containers {
 			c := &rJob.Template.Spec.Template.Spec.Containers[j]
 
-			// if c.Name != nil && *c.Name == "node" {
-			if c.Name != nil {
+			if c.Name != nil && *c.Name == "node" {
 
 				// Force remote runner
 				c.Command = []string{"python3", "/runner/firecrest_runner.py"}
@@ -200,18 +199,22 @@ func (r *Remote) Build(
 				// SCRIPT_URI (optional, overrides SCRIPT_PATH)
 				scriptURI := strings.TrimSpace(job.Annotations[ScriptURIAnnotation])
 
-				if scriptURI != "" {
-					var newEnv []corev1ac.EnvVar
-					for _, e := range c.Env {
-						if e.Name == "SCRIPT_PATH" {
-							continue
-						}
-						newEnv = append(newEnv, e)
+				var newEnv []corev1ac.EnvVarApplyConfiguration
+
+				for i := range c.Env {
+					e := c.Env[i]
+
+					if e.Name != nil && *e.Name == "SCRIPT_PATH" {
+						continue
 					}
-					c.Env = newEnv
-					c.Env = upsertEnvVar(c.Env, "SCRIPT_URI", scriptURI)
+
+					newEnv = append(newEnv, e)
+				}
+
+				c.Env = newEnv
+				c.Env = upsertEnvVar(c.Env, "SCRIPT_URI", scriptURI)
 				} else {
-					c.Env = upsertEnvVar(c.Env, "SCRIPT_PATH", ScriptFilePath)
+				c.Env = upsertEnvVar(c.Env, "SCRIPT_PATH", ScriptFilePath)
 				}
 
 				// DEBUG
