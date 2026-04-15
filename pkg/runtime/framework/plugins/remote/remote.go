@@ -199,22 +199,24 @@ func (r *Remote) Build(
 				// SCRIPT_URI (optional, overrides SCRIPT_PATH)
 				scriptURI := strings.TrimSpace(job.Annotations[ScriptURIAnnotation])
 
-				var newEnv []corev1ac.EnvVarApplyConfiguration
+				if scriptURI != "" {
+					var newEnv []corev1ac.EnvVarApplyConfiguration
 
-				for i := range c.Env {
-					e := c.Env[i]
+					for i := range c.Env {
+						e := c.Env[i]
 
-					if e.Name != nil && *e.Name == "SCRIPT_PATH" {
-						continue
+						if e.Name != nil && *e.Name == "SCRIPT_PATH" {
+							continue
+						}
+
+						newEnv = append(newEnv, e)
 					}
 
-					newEnv = append(newEnv, e)
-				}
+					c.Env = newEnv
+					c.Env = upsertEnvVar(c.Env, "SCRIPT_URI", scriptURI)
 
-				c.Env = newEnv
-				c.Env = upsertEnvVar(c.Env, "SCRIPT_URI", scriptURI)
 				} else {
-				c.Env = upsertEnvVar(c.Env, "SCRIPT_PATH", ScriptFilePath)
+					c.Env = upsertEnvVar(c.Env, "SCRIPT_PATH", ScriptFilePath)
 				}
 
 				// DEBUG
