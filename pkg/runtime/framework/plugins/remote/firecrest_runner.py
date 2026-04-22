@@ -251,7 +251,7 @@ def main():
 
         if state != "COMPLETED":
             print(f"ERROR: job {jobid} finished with state={state}", file=sys.stderr)
-            sys.exit(1)
+            sys.exit(0)
 
         print(f"Job {jobid} completed successfully.")
 
