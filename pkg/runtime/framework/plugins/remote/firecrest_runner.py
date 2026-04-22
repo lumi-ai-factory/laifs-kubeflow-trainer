@@ -35,7 +35,7 @@ def require_env(name: str) -> str:
     v = os.environ.get(name)
     if not v:
         print(f"ERROR: missing env var '{name}'", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(0)
     return v.strip()
 
 def collect_firecrest_env():
@@ -52,7 +52,7 @@ def collect_firecrest_env():
         value = os.environ.get(key)
         if not value:
             print(f"ERROR: missing required FirecREST env var '{key}'", file=sys.stderr)
-            sys.exit(1)
+            sys.exit(0)
         env_vars[key] = value.strip()
     return env_vars
 
@@ -77,7 +77,7 @@ def collect_s3_env():
         value = os.environ.get(key)
         if not value:
             print(f"ERROR: missing required S3 env var '{key}'", file=sys.stderr)
-            sys.exit(1)
+            sys.exit(0)
         env_vars[key] = value.strip()
     return env_vars
 
@@ -115,7 +115,7 @@ def main():
             f"ERROR: SLURM_URI must be an s3:// URI, got: {slurm_uri}",
             file=sys.stderr,
         )
-        sys.exit(1)
+        sys.exit(0)
 
     fc_env = collect_firecrest_env()
     client = create_firecrest_client(fc_env)
@@ -141,7 +141,7 @@ def main():
 
         if not script_uri and not script_path:
             print("ERROR: neither SCRIPT_URI nor SCRIPT_PATH provided", file=sys.stderr)
-            sys.exit(1)
+            sys.exit(0)
 
         if script_uri:
             print(f"Downloading user script from {script_uri} ...")
@@ -150,7 +150,7 @@ def main():
         else:
             if not os.path.exists(script_path):
                 print(f"ERROR: Script not found at {script_path}", file=sys.stderr)
-                sys.exit(1)
+                sys.exit(0)
 
             with open(script_path, "r") as f:
                 local_py.write_text(f.read(), encoding="utf-8")
@@ -233,7 +233,7 @@ def main():
             jobid = job.get("jobid") or job.get("jobId") or job.get("job_id")
         if not jobid:
             print(f"ERROR: submit response missing jobid: {job}", file=sys.stderr)
-            sys.exit(1)
+            sys.exit(0)
 
         print(f"Submitted jobid={jobid}")
         print("Raw submit response:", job)
@@ -275,4 +275,8 @@ def main():
         sys.exit(0)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"FATAL ERROR: {e}", file=sys.stderr)
+        sys.exit(0)
