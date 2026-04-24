@@ -119,7 +119,7 @@ func (r *Remote) Build(
 	job *trainer.TrainJob,
 ) ([]apiruntime.ApplyConfiguration, error) {
 
-	if job.Spec.RuntimeRef == nil || job.Spec.RuntimeRef.Name != Name {
+	if job.Spec.RuntimeRef.Name != Name {
     return nil, nil
 	}
 
