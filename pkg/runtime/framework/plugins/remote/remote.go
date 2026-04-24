@@ -119,6 +119,10 @@ func (r *Remote) Build(
 	job *trainer.TrainJob,
 ) ([]apiruntime.ApplyConfiguration, error) {
 
+	if job.Spec.RuntimeRef == nil || job.Spec.RuntimeRef.Name != Name {
+    return nil, nil
+	}
+
 	if info == nil || job == nil || job.Spec.Trainer == nil {
 		return nil, nil
 	}
@@ -148,7 +152,8 @@ func (r *Remote) Build(
 	// Access the underlying JobSet apply configuration (actual pod template)
 	jobSetSpec, ok := runtime.TemplateSpecApply[jobsetv1alpha2ac.JobSetSpecApplyConfiguration](info)
 	if !ok {
-		return nil, fmt.Errorf("remote-runtime: expected JobSet template")
+		// return nil, fmt.Errorf("remote-runtime: expected JobSet template")
+		return nil, nil
 	}
 
 	for i := range jobSetSpec.ReplicatedJobs {
@@ -187,8 +192,21 @@ func (r *Remote) Build(
 						WithMountPath(ScriptMountDir),
 				)
 
+				/* old
 				// SLURM_URI (required)
 				slurmURI := strings.TrimSpace(job.Annotations[SlurmURIAnnotation])
+				if slurmURI == "" {
+					return nil, fmt.Errorf("remote-runtime: required annotation %q is missing", SlurmURIAnnotation)
+				}
+				c.Env = upsertEnvVar(c.Env, "SLURM_URI", slurmURI)
+				*/
+
+				// SLURM_URI (required)
+				slurmURI := ""
+				if job.Annotations != nil {
+					slurmURI = strings.TrimSpace(job.Annotations[SlurmURIAnnotation])
+				}
+
 				if slurmURI == "" {
 					return nil, fmt.Errorf("remote-runtime: required annotation %q is missing", SlurmURIAnnotation)
 				}
@@ -222,7 +240,7 @@ func (r *Remote) Build(
 
 				val, ok := job.Annotations[ScriptURIAnnotation]
 				fmt.Printf("DEBUG script-uri found=%v value='%s'\n", ok, val)
-/*
+/* old
 				// Pass script location to the runner via env
 				c.Env = append(c.Env,
 					*corev1ac.EnvVar().
