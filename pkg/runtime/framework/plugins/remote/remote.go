@@ -235,48 +235,8 @@ func (r *Remote) Build(
 					c.Env = upsertEnvVar(c.Env, "SCRIPT_PATH", ScriptFilePath)
 				}
 
-				// DEBUG
-				fmt.Printf("DEBUG annotations: %+v\n", job.Annotations)
-
-				val, ok := job.Annotations[ScriptURIAnnotation]
-				fmt.Printf("DEBUG script-uri found=%v value='%s'\n", ok, val)
-/* old
-				// Pass script location to the runner via env
-				c.Env = append(c.Env,
-					*corev1ac.EnvVar().
-						WithName("SCRIPT_PATH").
-						WithValue(ScriptFilePath),
-				)
-
-				// Pass SLURM script path via annotation
-				slurmURI := ""
-				if job.Annotations != nil {
-					slurmURI = strings.TrimSpace(job.Annotations[SlurmURIAnnotation])
-				}
-
-				if slurmURI == "" {
-					return nil, fmt.Errorf("remote-runtime: required annotation %q is missing", SlurmURIAnnotation)
-				}
-
-				c.Env = append(c.Env,
-					*corev1ac.EnvVar().
-						WithName("SLURM_URI").
-						WithValue(slurmURI),
-				)
-
-				// Pass script path via annotation
-				scriptURI := ""
-				if job.Annotations != nil {
-					scriptURI = strings.TrimSpace(job.Annotations[ScriptURIAnnotation])
-				}
-
-				if scriptURI != "" {
-					c.Env = append(c.Env,
-						*corev1ac.EnvVar().
-							WithName("SCRIPT_URI").
-							WithValue(scriptURI),
-					)
-				}*/
+				// WIP
+				c.Env = upsertEnvVar(c.Env, "TRAINJOB_NAME", job.Name)
 
 			}
 		}

@@ -104,6 +104,41 @@ def download_from_s3(uri: str, dst_path: Path) -> None:
     if dst_path.stat().st_size == 0:
         raise RuntimeError(f"Downloaded file from {uri} is empty.")
 
+def patch_trainjob_annotation(job_id: str):
+    import requests
+
+    k8s_host = os.environ["KUBERNETES_SERVICE_HOST"]
+    k8s_port = os.environ["KUBERNETES_SERVICE_PORT"]
+
+    namespace = open("/var/run/secrets/kubernetes.io/serviceaccount/namespace").read()
+    token = open("/var/run/secrets/kubernetes.io/serviceaccount/token").read()
+
+    trainjob_name = os.environ.get("TRAINJOB_NAME")
+    if not trainjob_name:
+        print("WARNING: TRAINJOB_NAME missing, skipping annotation patch")
+        return
+
+    url = f"https://{k8s_host}:{k8s_port}/apis/trainer.kubeflow.org/v1alpha1/namespaces/{namespace}/trainjobs/{trainjob_name}"
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/merge-patch+json",
+    }
+
+    payload = {
+        "metadata": {
+            "annotations": {
+                "remote.trainer.kubeflow.org/job-id": str(job_id)
+            }
+        }
+    }
+
+    try:
+        resp = requests.patch(url, json=payload, headers=headers, verify=False)
+        print(f"Patch response: {resp.status_code} {resp.text}")
+    except Exception as e:
+        print(f"WARNING: failed to patch annotation: {e}")
+
 
 def main():
 
@@ -236,7 +271,11 @@ def main():
             sys.exit(0)
 
         print(f"Submitted jobid={jobid}")
+
+        patch_trainjob_annotation(jobid)
+
         print("Raw submit response:", job)
+
 
         # --- Poll for completion ---
         print("Waiting for job to finish...")
