@@ -35,7 +35,7 @@ def require_env(name: str) -> str:
     v = os.environ.get(name)
     if not v:
         print(f"ERROR: missing env var '{name}'", file=sys.stderr)
-        sys.exit(0)
+        sys.exit(1)
     return v.strip()
 
 def collect_firecrest_env():
@@ -52,7 +52,7 @@ def collect_firecrest_env():
         value = os.environ.get(key)
         if not value:
             print(f"ERROR: missing required FirecREST env var '{key}'", file=sys.stderr)
-            sys.exit(0)
+            sys.exit(1)
         env_vars[key] = value.strip()
     return env_vars
 
@@ -77,7 +77,7 @@ def collect_s3_env():
         value = os.environ.get(key)
         if not value:
             print(f"ERROR: missing required S3 env var '{key}'", file=sys.stderr)
-            sys.exit(0)
+            sys.exit(1)
         env_vars[key] = value.strip()
     return env_vars
 
@@ -150,7 +150,7 @@ def main():
             f"ERROR: SLURM_URI must be an s3:// URI, got: {slurm_uri}",
             file=sys.stderr,
         )
-        sys.exit(0)
+        sys.exit(1)
 
     fc_env = collect_firecrest_env()
     client = create_firecrest_client(fc_env)
@@ -277,7 +277,7 @@ def main():
             jobid = job.get("jobid") or job.get("jobId") or job.get("job_id")
         if not jobid:
             print(f"ERROR: submit response missing jobid: {job}", file=sys.stderr)
-            sys.exit(0)
+            sys.exit(1)
 
         print(f"Submitted jobid={jobid}")
 
@@ -299,7 +299,7 @@ def main():
 
         if state != "COMPLETED":
             print(f"ERROR: job {jobid} finished with state={state}", file=sys.stderr)
-            sys.exit(0)
+            sys.exit(1)
 
         print(f"Job {jobid} completed successfully.")
 
@@ -320,11 +320,11 @@ def main():
             print(f"(Could not fetch stderr: {e})")
 
         print("Remote job completed successfully.")
-        sys.exit(0)
+        sys.exit(1)
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
         print(f"FATAL ERROR: {e}", file=sys.stderr)
-        sys.exit(0)
+        sys.exit(1)
