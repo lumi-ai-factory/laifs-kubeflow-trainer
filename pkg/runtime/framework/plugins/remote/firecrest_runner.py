@@ -185,7 +185,7 @@ def main():
         else:
             if not os.path.exists(script_path):
                 print(f"ERROR: Script not found at {script_path}", file=sys.stderr)
-                sys.exit(0)
+                sys.exit(1)
 
             with open(script_path, "r") as f:
                 local_py.write_text(f.read(), encoding="utf-8")
