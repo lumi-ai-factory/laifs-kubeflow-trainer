@@ -320,7 +320,7 @@ def main():
             print(f"(Could not fetch stderr: {e})")
 
         print("Remote job completed successfully.")
-        sys.exit(1)
+        sys.exit(0)
 
 if __name__ == "__main__":
     try:
