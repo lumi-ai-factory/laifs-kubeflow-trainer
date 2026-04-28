@@ -176,12 +176,22 @@ def main():
 
         if not script_uri and not script_path:
             print("ERROR: neither SCRIPT_URI nor SCRIPT_PATH provided", file=sys.stderr)
-            sys.exit(0)
+            sys.exit(1)
 
         if script_uri:
             print(f"Downloading user script from {script_uri} ...")
-            download_from_s3(script_uri, local_py)
+            try:
+                download_from_s3(script_uri, local_py)
+            except Exception as e:
+                print(f"FATAL ERROR: {e}", file=sys.stderr)
+                sys.exit(1)
+
+            if not local_py.exists() or local_py.stat().st_size == 0:
+                print("FATAL ERROR: downloaded file missing or empty", file=sys.stderr)
+                sys.exit(1)
+
             print("Download OK.")
+
         else:
             if not os.path.exists(script_path):
                 print(f"ERROR: Script not found at {script_path}", file=sys.stderr)
@@ -189,7 +199,6 @@ def main():
 
             with open(script_path, "r") as f:
                 local_py.write_text(f.read(), encoding="utf-8")
-
 
         # --- ENV ---
         lines = [f"export {k}='{v}'" for k, v in s3_env.items()]
