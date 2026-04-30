@@ -156,6 +156,7 @@ func (r *Remote) Build(
 		return nil, nil
 	}
 
+	jobSetSpec.FailurePolicy = nil
 	jobSetSpec.WithFailurePolicy(
 		jobsetv1alpha2ac.FailurePolicy().
 			WithMaxRestarts(0),
