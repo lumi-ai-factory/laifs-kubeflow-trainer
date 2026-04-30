@@ -158,7 +158,7 @@ func (r *Remote) Build(
 
 	jobSetSpec.WithFailurePolicy(
 		jobsetv1alpha2ac.FailurePolicy().
-			WithRestartStrategy("Never"),
+			WithMaxRestarts(0),
 )
 
 	for i := range jobSetSpec.ReplicatedJobs {
