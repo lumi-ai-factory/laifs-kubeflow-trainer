@@ -2,6 +2,8 @@
 
 This repository implements a custom Kubeflow Trainer runtime that executes training jobs on an external HPC system instead of inside Kubernetes.
 
+It is built on top of a fork of Kubeflow Trainer (based on the latest stable release v2.1.0).
+
 The runtime is designed to be simple and low-overhead:
 - Kubernetes handles orchestration
 - Actual compute runs on HPC via FirecREST
