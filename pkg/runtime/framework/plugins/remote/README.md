@@ -2,9 +2,9 @@
 
 This repository implements a custom Kubeflow Trainer runtime that executes training jobs on an external HPC system instead of inside Kubernetes.
 
-It is built on top of a fork of Kubeflow Trainer (based on the latest stable release v2.1.0).
+It is built on top of a fork of Kubeflow Trainer (based on the latest stable release v2.1.0), in order to integrate a custom runtime plugin that enables remote execution via FirecREST.
 
-The runtime is designed to be simple and low-overhead:
+The runtime is designed to be simple:
 - Kubernetes handles orchestration
 - Actual compute runs on HPC via FirecREST
 - Minimal components, minimal complexity
@@ -102,16 +102,11 @@ spec:
                         - secretRef:
                             name: firecrest-secret
 ```
-This resource is typically deployed via Kubeflow overlays (e.g. Kustomize), together with:
-
-- image overrides
-- RBAC
-- secrets
-- networking policies
+This resource is typically deployed as part of a Kubeflow setup (e.g. via Kustomize overlays), together with required images and secrets (described below).
 
 ## Required Environment Variables
 These are provided via Kubernetes Secrets, which are pointed to in remote.yaml example above:
-### firecrest-secret
+### firecrest-secret:
 ```
 FIRECREST_URL
 FIRECREST_TOKEN
@@ -119,7 +114,7 @@ FIRECREST_MACHINE
 FIRECREST_REMOTE_PATH
 FIRECREST_ACCOUNT
 ```
-### aws-secret
+### aws-secret:
 ```
 AWS_ACCESS_KEY_ID
 AWS_SECRET_ACCESS_KEY
@@ -191,12 +186,6 @@ job_id = TrainerClient().train(
 - If the Kubernetes pod terminates, the HPC job continues independently
 - The system does not currently reattach to running HPC jobs
 - The HPC job ID is stored as a TrainJob annotation for traceability
-
-## Design Principles
-
-- Keep the system simple
-- Minimize moving parts
-- Avoid unnecessary orchestration layers
 
 ## Status
 
