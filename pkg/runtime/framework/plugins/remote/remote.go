@@ -160,6 +160,7 @@ func (r *Remote) Build(
 	jobSetSpec.WithFailurePolicy(
 		jobsetv1alpha2ac.FailurePolicy().
 			WithMaxRestarts(0),
+			WithRestartStrategy("None"),
 )
 
 	for i := range jobSetSpec.ReplicatedJobs {
@@ -197,15 +198,6 @@ func (r *Remote) Build(
 						WithName(ScriptVolumeName).
 						WithMountPath(ScriptMountDir),
 				)
-
-				/* old
-				// SLURM_URI (required)
-				slurmURI := strings.TrimSpace(job.Annotations[SlurmURIAnnotation])
-				if slurmURI == "" {
-					return nil, fmt.Errorf("remote-runtime: required annotation %q is missing", SlurmURIAnnotation)
-				}
-				c.Env = upsertEnvVar(c.Env, "SLURM_URI", slurmURI)
-				*/
 
 				// SLURM_URI (required)
 				slurmURI := ""
