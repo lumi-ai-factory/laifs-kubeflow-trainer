@@ -157,11 +157,13 @@ func (r *Remote) Build(
 	}
 
 	jobSetSpec.FailurePolicy = nil
-	jobSetSpec.WithFailurePolicy(
-		jobsetv1alpha2ac.FailurePolicy().
-			WithMaxRestarts(0),
-			WithRestartStrategy("None"),
-)
+	fp := jobsetv1alpha2ac.FailurePolicy().
+    WithMaxRestarts(0)
+
+	strategy := "None"
+	fp.RestartStrategy = &strategy
+
+	jobSetSpec.WithFailurePolicy(fp)
 
 	for i := range jobSetSpec.ReplicatedJobs {
 		rJob := &jobSetSpec.ReplicatedJobs[i]
