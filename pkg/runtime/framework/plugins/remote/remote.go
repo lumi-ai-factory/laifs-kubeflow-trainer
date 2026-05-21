@@ -161,7 +161,7 @@ func (r *Remote) Build(
 	fp := jobsetv1alpha2ac.FailurePolicy().
     WithMaxRestarts(0)
 
-	strategy := "None"
+	strategy := jobsetv1alpha2.JobSetRestartStrategy("None")
 	fp.RestartStrategy = &strategy
 
 	jobSetSpec.WithFailurePolicy(fp)
