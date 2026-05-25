@@ -281,6 +281,18 @@ def main():
 
         print(f"Submitted jobid={jobid}")
 
+        # ---- Change remote working directory name for easy debugging ---
+
+        final_job_dir = f"{day_path}/{jobid}"
+
+        print(f"Renaming remote directory to {final_job_dir}")
+
+        client.mv(
+            machine,
+            source_path=job_dir,
+            target_path=final_job_dir,
+        )
+
         patch_trainjob_annotation(jobid)
 
         print("Raw submit response:", job)
@@ -304,8 +316,8 @@ def main():
         print(f"Job {jobid} completed successfully.")
 
         # ---- Fetch logs ----
-        out_file = f"{job_dir}/firecrest-{jobid}.out"
-        err_file = f"{job_dir}/firecrest-{jobid}.err"
+        out_file = f"{final_job_dir}/firecrest-{jobid}.out"
+        err_file = f"{final_job_dir}/firecrest-{jobid}.err"
 
         print("\n--- REMOTE STDOUT ---")
         try:
