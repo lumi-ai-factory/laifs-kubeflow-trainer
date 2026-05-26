@@ -281,6 +281,24 @@ def main():
 
         print(f"Submitted jobid={jobid}")
 
+        print(f"Submitted jobid={jobid}")
+
+        final_job_dir = f"{day_path}/{jobid}"
+
+        print(f"Renaming remote directory to {final_job_dir}")
+
+        try:
+            client.mv(
+                machine,
+                source_path=job_dir,
+                target_path=final_job_dir,
+            )
+
+            job_dir = final_job_dir
+
+        except Exception as e:
+            print(f"WARNING: failed to rename remote directory: {e}")
+
         patch_trainjob_annotation(jobid)
 
         print("Raw submit response:", job)
