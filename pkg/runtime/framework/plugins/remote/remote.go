@@ -165,6 +165,9 @@ func (r *Remote) Build(
 	for i := range jobSetSpec.ReplicatedJobs {
 		rJob := &jobSetSpec.ReplicatedJobs[i]
 
+		zero := int32(0)
+		rJob.Template.Spec.BackoffLimit = &zero
+
 		if rJob.Template == nil ||
 			rJob.Template.Spec == nil ||
 			rJob.Template.Spec.Template == nil ||
