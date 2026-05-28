@@ -216,7 +216,7 @@ def main():
         date_dir = now.strftime("%Y-%m-%d")
         day_path = f"{remote_path}/kf_output/{date_dir}"
 
-        run_id = uuid.uuid4().hex[:6]
+        run_id = now.strftime("%H-%M-%S") + "_" + uuid.uuid4().hex[:6]
         job_dir = f"{day_path}/{run_id}"
 
         try:
