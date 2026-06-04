@@ -165,20 +165,24 @@ def main():
 
         s3_env = collect_s3_env()
 
-        script_name = Path(script_uri).name
-        slurm_name = Path(slurm_uri).name
-
-        local_py = td / script_name
-        local_slurm = td / slurm_name
-        local_env = td / ".env"
-
-        # --- SCRIPT ---
+        # --- SCRIPTS ---
         script_uri = os.environ.get("SCRIPT_URI")
         script_path = os.environ.get("SCRIPT_PATH")
 
         if not script_uri and not script_path:
             print("ERROR: neither SCRIPT_URI nor SCRIPT_PATH provided", file=sys.stderr)
             sys.exit(1)
+
+        if script_uri:
+            script_name = Path(script_uri).name
+        else:
+            script_name = Path(script_path).name
+
+        slurm_name = Path(slurm_uri).name
+
+        local_py = td / script_name
+        local_slurm = td / slurm_name
+        local_env = td / ".env"
 
         if script_uri:
             print(f"Downloading user script from {script_uri} ...")
@@ -286,7 +290,6 @@ def main():
         patch_trainjob_annotation(jobid)
 
         print("Raw submit response:", job)
-
 
         # --- Poll for completion ---
         print("Waiting for job to finish...")
