@@ -44,7 +44,6 @@ def collect_firecrest_env():
         "FIRECREST_TOKEN", #
         "FIRECREST_MACHINE",
         "FIRECREST_REMOTE_PATH", # path to your home or project scratch directory for SLURM OUTPUTS
-        "FIRECREST_REMOTE_FILE_PATH",
         "FIRECREST_ACCOUNT", # your LUMI project as 'project_xxxxxxxxxx'
         ]
     env_vars = {}
