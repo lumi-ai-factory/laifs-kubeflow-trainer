@@ -225,14 +225,16 @@ def main():
         run_id = now.strftime("%H-%M-%S") + "_" + uuid.uuid4().hex[:6]
         job_dir = f"{day_path}/{run_id}"
 
+        print("Creating remote directory...")
         try:
             client.mkdir(machine, job_dir, create_parents=True)
         except FirecrestException as e:
             if "File exists" not in str(e):
                 raise
+        print("Remote directory created")
 
         # --- Upload files to the remote working directory ---
-        print(f"Uploading script.py, job.slurm and .env to {machine}:{job_dir} ...")
+        print(f"Uploading {script_name} to {machine}:{job_dir} ...")
         client.upload(
             system_name=machine,
             local_file=str(local_py),
@@ -241,7 +243,9 @@ def main():
             account=account,
             blocking=True,
         )
-        print("Uploaded script.py")
+        print(f"Uploaded {script_name}")
+
+        print(f"Uploading {slurm_name} to {machine}:{job_dir} ...")
         client.upload(
             system_name=machine,
             local_file=str(local_slurm),
@@ -250,7 +254,9 @@ def main():
             account=account,
             blocking=True,
         )
-        print("Uploaded job.slurm")
+        print(f"Uploaded {slurm_name}")
+
+        print(f"Uploading .env to {machine}:{job_dir} ...")
         client.upload(
             system_name=machine,
             local_file=str(local_env),
