@@ -166,8 +166,11 @@ def main():
 
         s3_env = collect_s3_env()
 
-        local_py = td / "script.py"
-        local_slurm = td / "job.slurm"
+        script_name = Path(script_uri).name
+        slurm_name = Path(slurm_uri).name
+
+        local_py = td / script_name
+        local_slurm = td / slurm_name
         local_env = td / ".env"
 
         # --- SCRIPT ---
@@ -231,7 +234,7 @@ def main():
             system_name=machine,
             local_file=str(local_py),
             directory=job_dir,
-            filename="script.py",
+            filename=script_name,
             account=account,
             blocking=True,
         )
@@ -240,7 +243,7 @@ def main():
             system_name=machine,
             local_file=str(local_slurm),
             directory=job_dir,
-            filename="job.slurm",
+            filename=slurm_name,
             account=account,
             blocking=True,
         )
@@ -258,7 +261,7 @@ def main():
         print("Upload OK.")
 
         # --- Submit SLURM job ---
-        remote_slurm_path = f"{job_dir}/job.slurm"
+        remote_slurm_path = f"{job_dir}/{slurm_name}"
         print(f"Submitting job: {remote_slurm_path}")
 
         ### DEBUG PRINTS
