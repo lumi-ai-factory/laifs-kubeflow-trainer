@@ -14,7 +14,6 @@ Fails fast on missing configuration.
 import os
 import sys
 from datetime import datetime
-import time
 import uuid
 import tempfile
 from pathlib import Path
@@ -40,11 +39,11 @@ def require_env(name: str) -> str:
 
 def collect_firecrest_env():
     keys = [
-        "FIRECREST_URL", #
-        "FIRECREST_TOKEN", #
+        "FIRECREST_URL",
+        "FIRECREST_TOKEN",
         "FIRECREST_MACHINE",
-        "FIRECREST_REMOTE_PATH", # path to your home or project scratch directory for SLURM OUTPUTS
-        "FIRECREST_ACCOUNT", # your LUMI project as 'project_xxxxxxxxxx'
+        "FIRECREST_REMOTE_PATH",
+        "FIRECREST_ACCOUNT",
         ]
     env_vars = {}
     for key in keys:
@@ -109,8 +108,8 @@ def patch_trainjob_annotation(job_id: str):
     k8s_host = os.environ["KUBERNETES_SERVICE_HOST"]
     k8s_port = os.environ["KUBERNETES_SERVICE_PORT"]
 
-    namespace = open("/var/run/secrets/kubernetes.io/serviceaccount/namespace").read()
-    token = open("/var/run/secrets/kubernetes.io/serviceaccount/token").read()
+    namespace = open("/var/run/secrets/kubernetes.io/serviceaccount/namespace").read().strip()
+    token = open("/var/run/secrets/kubernetes.io/serviceaccount/token").read().strip()
 
     trainjob_name = os.environ.get("TRAINJOB_NAME")
     if not trainjob_name:
@@ -133,8 +132,17 @@ def patch_trainjob_annotation(job_id: str):
     }
 
     try:
-        resp = requests.patch(url, json=payload, headers=headers, verify=False)
-        print(f"Patch response: {resp.status_code} {resp.text}")
+        resp = requests.patch(url,
+                              json=payload,
+                              headers=headers,
+                              verify="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+                              )
+
+        if resp.status_code >= 300:
+            print(
+                f"WARNING: annotation patch failed: "
+                f"{resp.status_code} {resp.text}"
+            )
     except Exception as e:
         print(f"WARNING: failed to patch annotation: {e}")
 
@@ -158,7 +166,7 @@ def main():
     remote_path = fc_env["FIRECREST_REMOTE_PATH"]
     account = fc_env["FIRECREST_ACCOUNT"]
 
-    # --- Prepare payload: user script + download SLURM submission script + from LUMI-O + .env with AWS secrets ---
+    # --- Prepare job payload: script, SLURM submission script and runtime environment ---
 
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
@@ -225,16 +233,16 @@ def main():
         run_id = now.strftime("%H-%M-%S") + "_" + uuid.uuid4().hex[:6]
         job_dir = f"{day_path}/{run_id}"
 
-        print("Creating remote directory...")
+        print("Creating remote working directory...")
         try:
             client.mkdir(machine, job_dir, create_parents=True)
         except FirecrestException as e:
             if "File exists" not in str(e):
                 raise
-        print("Remote directory created")
+        print("Remote working directory created.")
 
         # --- Upload files to the remote working directory ---
-        print(f"Uploading {script_name} to {machine}:{job_dir} ...")
+        print(f"Uploading {script_name}, {slurm_name} and .env to {machine}:{job_dir} ...")
         client.upload(
             system_name=machine,
             local_file=str(local_py),
@@ -243,9 +251,7 @@ def main():
             account=account,
             blocking=True,
         )
-        print(f"Uploaded {script_name}")
 
-        print(f"Uploading {slurm_name} to {machine}:{job_dir} ...")
         client.upload(
             system_name=machine,
             local_file=str(local_slurm),
@@ -254,9 +260,7 @@ def main():
             account=account,
             blocking=True,
         )
-        print(f"Uploaded {slurm_name}")
 
-        print(f"Uploading .env to {machine}:{job_dir} ...")
         client.upload(
             system_name=machine,
             local_file=str(local_env),
@@ -265,17 +269,12 @@ def main():
             account=account,
             blocking=True,
         )
-        print("Uploaded .env")
 
-        print("Upload OK.")
+        print("Job files uploaded successfully.")
 
         # --- Submit SLURM job ---
         remote_slurm_path = f"{job_dir}/{slurm_name}"
         print(f"Submitting job: {remote_slurm_path}")
-
-        ### DEBUG PRINTS
-        print(f"Using SCRIPT_PATH={os.environ.get('SCRIPT_PATH')}")
-        print(f"Using SCRIPT_URI={os.environ.get('SCRIPT_URI')}")
 
         job = client.submit(
             machine,
@@ -295,12 +294,9 @@ def main():
 
         patch_trainjob_annotation(jobid)
 
-        print("Raw submit response:", job)
-
         # --- Poll for completion ---
         print("Waiting for job to finish...")
         result = client.wait_for_job(machine, jobid)
-        print("wait_for_job result:", result)
 
         state = None
         if isinstance(result, list) and len(result) > 0:
