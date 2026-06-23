@@ -70,13 +70,37 @@ def collect_s3_env():
         "S3_ENDPOINT_URL",
         "S3_REGION",
         ]
+
     env_vars = {}
+
     for key in keys:
         value = os.environ.get(key)
         if not value:
             print(f"ERROR: missing required S3 env var '{key}'", file=sys.stderr)
             sys.exit(1)
         env_vars[key] = value.strip()
+
+    return env_vars
+
+def collect_mlflow_env():
+    keys = [
+        "MLFLOW_TRACKING_URI",
+        "MLFLOW_TRACKING_USERNAME",
+        "MLFLOW_TRACKING_PASSWORD",
+    ]
+
+    env_vars = {}
+
+    for key in keys:
+        value = os.environ.get(key)
+        if not value:
+            print(
+                f"ERROR: missing required MLflow env var '{key}'",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        env_vars[key] = value.strip()
+
     return env_vars
 
 def download_from_s3(uri: str, dst_path: Path) -> None:
@@ -101,6 +125,8 @@ def download_from_s3(uri: str, dst_path: Path) -> None:
 
     if dst_path.stat().st_size == 0:
         raise RuntimeError(f"Downloaded file from {uri} is empty.")
+
+
 
 def patch_trainjob_annotation(job_id: str):
     import requests
@@ -172,6 +198,7 @@ def main():
         td = Path(td)
 
         s3_env = collect_s3_env()
+        mlflow_env = collect_mlflow_env()
 
         # --- SCRIPTS ---
         script_uri = os.environ.get("SCRIPT_URI")
@@ -215,6 +242,11 @@ def main():
                 local_py.write_text(f.read(), encoding="utf-8")
 
         # --- ENV ---
+
+        env_vars = {
+            **s3_env,
+            **collect_mlflow_env(),
+}
         lines = [f"export {k}='{v}'" for k, v in s3_env.items()]
         local_env.write_text("\n".join(lines))
 
