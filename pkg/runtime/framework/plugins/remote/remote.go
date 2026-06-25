@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"strings"
 
+	configapi "github.com/kubeflow/trainer/v2/pkg/apis/config/v1alpha1"
 	apiruntime "k8s.io/apimachinery/pkg/runtime"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -47,7 +48,7 @@ type Remote struct {
 
 var _ framework.ComponentBuilderPlugin = (*Remote)(nil)
 
-func New(_ context.Context, c client.Client, _ client.FieldIndexer) (framework.Plugin, error) {
+func New(_ context.Context, c client.Client, _ client.FieldIndexer, *configapi.Configuration) (framework.Plugin, error) {
 	return &Remote{client: c}, nil
 }
 
