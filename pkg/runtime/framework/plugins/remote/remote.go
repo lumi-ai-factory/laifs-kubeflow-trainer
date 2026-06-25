@@ -48,7 +48,7 @@ type Remote struct {
 
 var _ framework.ComponentBuilderPlugin = (*Remote)(nil)
 
-func New(_ context.Context, c client.Client, _ client.FieldIndexer, *configapi.Configuration) (framework.Plugin, error) {
+func New(_ context.Context, c client.Client, _ client.FieldIndexer, _ *configapi.Configuration) (framework.Plugin, error) {
 	return &Remote{client: c}, nil
 }
 
