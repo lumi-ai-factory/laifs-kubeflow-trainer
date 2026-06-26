@@ -126,8 +126,6 @@ def download_from_s3(uri: str, dst_path: Path) -> None:
     if dst_path.stat().st_size == 0:
         raise RuntimeError(f"Downloaded file from {uri} is empty.")
 
-
-
 def patch_trainjob_annotation(job_id: str):
     import requests
 
@@ -197,9 +195,6 @@ def main():
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
 
-        s3_env = collect_s3_env()
-        mlflow_env = collect_mlflow_env()
-
         # --- SCRIPTS ---
         script_uri = os.environ.get("SCRIPT_URI")
         script_path = os.environ.get("SCRIPT_PATH")
@@ -243,11 +238,14 @@ def main():
 
         # --- ENV ---
 
+        s3_env = collect_s3_env()
+        mlflow_env = collect_mlflow_env()
+
         env_vars = {
             **s3_env,
-            **collect_mlflow_env(),
+            **mlflow_env,
 }
-        lines = [f"export {k}='{v}'" for k, v in s3_env.items()]
+        lines = [f"export {k}='{v}'" for k, v in env_vars.items()]
         local_env.write_text("\n".join(lines))
 
         # --- SLURM ---
