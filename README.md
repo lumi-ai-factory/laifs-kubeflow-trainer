@@ -1,4 +1,12 @@
-# Kubeflow Trainer
+# Kubeflow Trainer for LUMI AI Factory
+
+This repository is a fork of Kubeflow Trainer maintained for **the LUMI AI Factory environment**.
+
+It includes LUMI AI Factory-specific functionality, including a custom Remote runtime for submitting training jobs to LUMI supercomputer.
+
+For details about the custom remote runtime, see `pkg/runtime/framework/plugins/remote/README.md`.
+
+---
 
 [![Join Slack](https://img.shields.io/badge/Join_Slack-blue?logo=slack)](https://www.kubeflow.org/docs/about/community/#kubeflow-slack-channels)
 [![Coverage Status](https://coveralls.io/repos/github/kubeflow/trainer/badge.svg?branch=master)](https://coveralls.io/github/kubeflow/trainer?branch=master)
