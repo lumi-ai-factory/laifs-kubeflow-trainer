@@ -338,6 +338,15 @@ func (j *JobSetWrapper) SchedulingGates(rJobName string, schedulingGates ...core
 	return j
 }
 
+func (j *JobSetWrapper) TerminationGracePeriodSeconds(rJobName string, seconds int64) *JobSetWrapper {
+	for i, rJob := range j.Spec.ReplicatedJobs {
+		if rJob.Name == rJobName {
+			j.Spec.ReplicatedJobs[i].Template.Spec.Template.Spec.TerminationGracePeriodSeconds = &seconds
+		}
+	}
+	return j
+}
+
 func (j *JobSetWrapper) ImagePullSecrets(rJobName string, imagePullSecrets ...corev1.LocalObjectReference) *JobSetWrapper {
 	for i, rJob := range j.Spec.ReplicatedJobs {
 		if rJob.Name == rJobName {
@@ -1130,6 +1139,18 @@ func (s *TrainingRuntimeSpecWrapper) LauncherReplica() *TrainingRuntimeSpecWrapp
 	return s
 }
 
+func (s *TrainingRuntimeSpecWrapper) DependsOn(
+	rJobName string,
+	dependsOn ...jobsetv1alpha2.DependsOn,
+) *TrainingRuntimeSpecWrapper {
+	for i, rJob := range s.Template.Spec.ReplicatedJobs {
+		if rJob.Name == rJobName {
+			s.Template.Spec.ReplicatedJobs[i].DependsOn = dependsOn
+		}
+	}
+	return s
+}
+
 func (s *TrainingRuntimeSpecWrapper) Replicas(replicas int32, rJobNames ...string) *TrainingRuntimeSpecWrapper {
 	for i, rJob := range s.Template.Spec.ReplicatedJobs {
 		if slices.Contains(rJobNames, rJob.Name) {
@@ -1258,6 +1279,11 @@ func (m *MLPolicySourceWrapper) TorchPolicy() *MLPolicySourceWrapper {
 	return m
 }
 
+func (m *MLPolicySourceWrapper) TorchPolicyWithEnvInjection(envInjection *trainer.EnvInjection) *MLPolicySourceWrapper {
+	m.Torch = &trainer.TorchMLPolicySource{EnvInjection: envInjection}
+	return m
+}
+
 func (w *MLPolicySourceWrapper) JAXPolicy() *MLPolicySourceWrapper {
 	w.JAX = &trainer.JAXMLPolicySource{}
 	return w
@@ -1276,6 +1302,14 @@ func (m *MLPolicySourceWrapper) MPIPolicy(numProcPerNode *int32, MPImplementatio
 	m.MPI.MPIImplementation = &MPImplementation
 	m.MPI.SSHAuthMountPath = sshAuthMountPath
 	m.MPI.RunLauncherAsNode = runLauncherAsNode
+	return m
+}
+
+func (m *MLPolicySourceWrapper) FluxPolicy(numProcPerNode *int32) *MLPolicySourceWrapper {
+	if m.Flux == nil {
+		m.Flux = &trainer.FluxMLPolicySource{}
+	}
+	m.Flux.NumProcPerNode = numProcPerNode
 	return m
 }
 

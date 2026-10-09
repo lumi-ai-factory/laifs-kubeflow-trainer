@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Kubeflow Authors.
+Copyright The Kubeflow Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -37,6 +38,41 @@ import (
 	jobsetplgconsts "github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/jobset/constants"
 	testingutil "github.com/kubeflow/trainer/v2/pkg/util/testing"
 )
+
+func torchTuneResWithCPU(gpu string) corev1.ResourceList {
+	return corev1.ResourceList{
+		corev1.ResourceCPU: resource.MustParse("1"),
+		"example.com/gpu":  resource.MustParse(gpu),
+	}
+}
+
+func wantJobSetWithMergedGPU(ns, name, uid string, requests corev1.ResourceList, gpu string) *jobsetv1alpha2.JobSet {
+	jobSet := testingutil.MakeJobSetWrapper(ns, name).
+		ControllerReference(trainer.SchemeGroupVersion.WithKind(trainer.TrainJobKind), name, uid).
+		Replicas(1, constants.DatasetInitializer, constants.ModelInitializer, constants.Node, constants.Launcher).
+		Parallelism(1, constants.DatasetInitializer, constants.ModelInitializer).
+		Completions(1, constants.DatasetInitializer, constants.ModelInitializer).
+		NumNodes(1).
+		Container(constants.Node, constants.Node, "test:runtime", []string{"runtime"}, []string{"runtime"}, requests).
+		Obj()
+	for i := range jobSet.Spec.ReplicatedJobs {
+		if jobSet.Spec.ReplicatedJobs[i].Name != constants.Node {
+			continue
+		}
+		for j := range jobSet.Spec.ReplicatedJobs[i].Template.Spec.Template.Spec.Containers {
+			container := &jobSet.Spec.ReplicatedJobs[i].Template.Spec.Template.Spec.Containers[j]
+			if container.Name != constants.Node {
+				continue
+			}
+			if container.Resources.Limits == nil {
+				container.Resources.Limits = corev1.ResourceList{}
+			}
+			container.Resources.Limits["nvidia.com/gpu"] = resource.MustParse(gpu)
+			return jobSet
+		}
+	}
+	return jobSet
+}
 
 func TestTrainingRuntimeNewObjects(t *testing.T) {
 	resRequests := corev1.ResourceList{
@@ -429,6 +465,7 @@ func TestTrainingRuntimeNewObjects(t *testing.T) {
 																	Effect:   corev1.TaintEffectNoSchedule,
 																},
 															},
+															TerminationGracePeriodSeconds: ptr.To(int64(300)),
 															Volumes: []corev1.Volume{
 																{
 																	Name: "node_secret",
@@ -574,6 +611,7 @@ func TestTrainingRuntimeNewObjects(t *testing.T) {
 							Operator: corev1.TolerationOpExists,
 							Effect:   corev1.TaintEffectNoSchedule,
 						}).
+					TerminationGracePeriodSeconds(constants.Node, 300).
 					Volumes(constants.DatasetInitializer,
 						corev1.Volume{
 							Name: "initializer_claim",
@@ -1558,7 +1596,7 @@ func TestTrainingRuntimeNewObjects(t *testing.T) {
 								"dataset=torchtune.datasets.instruct_dataset",
 								"dataset.source=parquet",
 							},
-							corev1.ResourceList{"example.com/gpu": resource.MustParse("2")},
+							torchTuneResWithCPU("2"),
 						).
 						NumNodes(1).
 						Obj(),
@@ -1593,7 +1631,7 @@ func TestTrainingRuntimeNewObjects(t *testing.T) {
 							"dataset=torchtune.datasets.instruct_dataset",
 							"dataset.source=parquet",
 						},
-						corev1.ResourceList{"example.com/gpu": resource.MustParse("2")},
+						torchTuneResWithCPU("2"),
 					).
 					ContainerTrainerPorts([]corev1.ContainerPort{{ContainerPort: constants.ContainerTrainerPort}}).
 					Env(constants.Node, constants.Node,
@@ -1699,7 +1737,7 @@ func TestTrainingRuntimeNewObjects(t *testing.T) {
 								"dataset=torchtune.datasets.instruct_dataset",
 								"dataset.source=parquet",
 							},
-							corev1.ResourceList{"example.com/gpu": resource.MustParse("1")},
+							torchTuneResWithCPU("1"),
 						).
 						NumNodes(1).
 						Obj(),
@@ -1734,7 +1772,7 @@ func TestTrainingRuntimeNewObjects(t *testing.T) {
 							"dataset=torchtune.datasets.instruct_dataset",
 							"dataset.source=parquet",
 						},
-						corev1.ResourceList{"example.com/gpu": resource.MustParse("1")},
+						torchTuneResWithCPU("1"),
 					).
 					ContainerTrainerPorts([]corev1.ContainerPort{{ContainerPort: constants.ContainerTrainerPort}}).
 					Env(constants.Node, constants.Node,
@@ -1841,7 +1879,7 @@ func TestTrainingRuntimeNewObjects(t *testing.T) {
 								"dataset=torchtune.datasets.instruct_dataset",
 								"dataset.source=parquet",
 							},
-							corev1.ResourceList{"example.com/gpu": resource.MustParse("2")},
+							torchTuneResWithCPU("2"),
 						).
 						NumNodes(1).
 						Obj(),
@@ -1878,7 +1916,7 @@ func TestTrainingRuntimeNewObjects(t *testing.T) {
 							"dataset=torchtune.datasets.instruct_dataset",
 							"dataset.source=parquet",
 						},
-						corev1.ResourceList{"example.com/gpu": resource.MustParse("2")},
+						torchTuneResWithCPU("2"),
 					).
 					ContainerTrainerPorts([]corev1.ContainerPort{{ContainerPort: constants.ContainerTrainerPort}}).
 					Env(constants.Node, constants.Node,
@@ -1978,19 +2016,23 @@ test-job-node-0-1.test-job slots=8
 							Name: constants.MPISSHAuthVolumeName,
 							VolumeSource: corev1.VolumeSource{
 								Secret: &corev1.SecretVolumeSource{
-									SecretName: fmt.Sprintf("test-job%s", constants.MPISSHAuthSecretSuffix),
+									SecretName:  fmt.Sprintf("test-job%s", constants.MPISSHAuthSecretSuffix),
+									DefaultMode: ptr.To(constants.MPISSHAuthDefaultMode),
 									Items: []corev1.KeyToPath{
 										{
 											Key:  corev1.SSHAuthPrivateKey,
 											Path: constants.MPISSHPrivateKeyFile,
+											Mode: ptr.To(constants.MPISSHPrivateKeyFileMode),
 										},
 										{
 											Key:  constants.MPISSHPublicKey,
 											Path: constants.MPISSHPublicKeyFile,
+											Mode: ptr.To(constants.MPISSHPublicKeyFileMode),
 										},
 										{
 											Key:  constants.MPISSHPublicKey,
 											Path: constants.MPISSHAuthorizedKeys,
+											Mode: ptr.To(constants.MPISSHPublicKeyFileMode),
 										},
 									},
 								},
@@ -2017,19 +2059,23 @@ test-job-node-0-1.test-job slots=8
 							Name: constants.MPISSHAuthVolumeName,
 							VolumeSource: corev1.VolumeSource{
 								Secret: &corev1.SecretVolumeSource{
-									SecretName: fmt.Sprintf("test-job%s", constants.MPISSHAuthSecretSuffix),
+									SecretName:  fmt.Sprintf("test-job%s", constants.MPISSHAuthSecretSuffix),
+									DefaultMode: ptr.To(constants.MPISSHAuthDefaultMode),
 									Items: []corev1.KeyToPath{
 										{
 											Key:  corev1.SSHAuthPrivateKey,
 											Path: constants.MPISSHPrivateKeyFile,
+											Mode: ptr.To(constants.MPISSHPrivateKeyFileMode),
 										},
 										{
 											Key:  constants.MPISSHPublicKey,
 											Path: constants.MPISSHPublicKeyFile,
+											Mode: ptr.To(constants.MPISSHPublicKeyFileMode),
 										},
 										{
 											Key:  constants.MPISSHPublicKey,
 											Path: constants.MPISSHAuthorizedKeys,
+											Mode: ptr.To(constants.MPISSHPublicKeyFileMode),
 										},
 									},
 								},
@@ -2063,6 +2109,36 @@ test-job-node-0-1.test-job slots=8
 					).
 					Container(constants.Node, constants.Node, "test:runtime", []string{"runtime"}, []string{"runtime"}, resRequests).
 					Obj(),
+			},
+		},
+		"merged resourcesPerNode keeps runtime resources when trainjob sets gpu only": {
+			trainingRuntime: testingutil.MakeTrainingRuntimeWrapper(metav1.NamespaceDefault, "test-runtime").RuntimeSpec(
+				testingutil.MakeTrainingRuntimeSpecWrapper(testingutil.MakeTrainingRuntimeWrapper(metav1.NamespaceDefault, "test-runtime").Spec).
+					WithMLPolicy(
+						testingutil.MakeMLPolicyWrapper().
+							WithNumNodes(1).
+							Obj(),
+					).
+					Container(constants.Node, constants.Node, "test:runtime", []string{"runtime"}, []string{"runtime"}, resRequests).
+					Obj(),
+			).Obj(),
+			trainJob: func() *trainer.TrainJob {
+				trainerSpec := testingutil.MakeTrainJobTrainerWrapper().
+					NumNodes(1).
+					Obj()
+				trainerSpec.ResourcesPerNode = &corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"nvidia.com/gpu": resource.MustParse("4"),
+					},
+				}
+				return testingutil.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
+					UID("uid").
+					RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.TrainingRuntimeKind), "test-runtime").
+					Trainer(trainerSpec).
+					Obj()
+			}(),
+			wantObjs: []runtime.Object{
+				wantJobSetWithMergedGPU(metav1.NamespaceDefault, "test-job", "uid", resRequests, "4"),
 			},
 		},
 		// Failed test cases.
@@ -2124,6 +2200,41 @@ test-job-node-0-1.test-job slots=8
 
 			if diff := cmp.Diff(tc.wantObjs, resultObjs, append(cmpOpts, tc.ObjCmpOpts...)...); len(diff) != 0 {
 				t.Errorf("Unexpected objects (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestRuntimeInfo(t *testing.T) {
+	tests := map[string]struct {
+		templateType string
+	}{
+		"invalid template type returns error": {
+			templateType: "invalid-template-type",
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			// Using zero-value TrainingRuntime is safe here because RuntimeInfo
+			// returns early for unsupported template types before accessing internal fields.
+			rt := &TrainingRuntime{}
+
+			trainJob := &trainer.TrainJob{}
+
+			_, err := rt.RuntimeInfo(
+				trainJob,
+				tt.templateType,
+				nil,
+				nil,
+			)
+
+			if err == nil {
+				t.Fatalf("expected error for unsupported runtimeTemplateSpec, got nil")
+			}
+
+			if !strings.Contains(err.Error(), "unsupported runtimeTemplateSpec") {
+				t.Errorf("unexpected error: %v", err)
 			}
 		})
 	}

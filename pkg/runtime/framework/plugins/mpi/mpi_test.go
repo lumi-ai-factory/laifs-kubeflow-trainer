@@ -137,16 +137,20 @@ func TestMPI(t *testing.T) {
 									WithName(constants.MPISSHAuthVolumeName).
 									WithSecret(corev1ac.SecretVolumeSource().
 										WithSecretName(fmt.Sprintf("trainJob%s", constants.MPISSHAuthSecretSuffix)).
+										WithDefaultMode(constants.MPISSHAuthDefaultMode).
 										WithItems(
 											corev1ac.KeyToPath().
 												WithKey(corev1.SSHAuthPrivateKey).
-												WithPath(constants.MPISSHPrivateKeyFile),
+												WithPath(constants.MPISSHPrivateKeyFile).
+												WithMode(constants.MPISSHPrivateKeyFileMode),
 											corev1ac.KeyToPath().
 												WithKey(constants.MPISSHPublicKey).
-												WithPath(constants.MPISSHPublicKeyFile),
+												WithPath(constants.MPISSHPublicKeyFile).
+												WithMode(constants.MPISSHPublicKeyFileMode),
 											corev1ac.KeyToPath().
 												WithKey(constants.MPISSHPublicKey).
-												WithPath(constants.MPISSHAuthorizedKeys),
+												WithPath(constants.MPISSHAuthorizedKeys).
+												WithMode(constants.MPISSHPublicKeyFileMode),
 										),
 									),
 								*corev1ac.Volume().
@@ -174,16 +178,20 @@ func TestMPI(t *testing.T) {
 									WithName(constants.MPISSHAuthVolumeName).
 									WithSecret(corev1ac.SecretVolumeSource().
 										WithSecretName(fmt.Sprintf("trainJob%s", constants.MPISSHAuthSecretSuffix)).
+										WithDefaultMode(constants.MPISSHAuthDefaultMode).
 										WithItems(
 											corev1ac.KeyToPath().
 												WithKey(corev1.SSHAuthPrivateKey).
-												WithPath(constants.MPISSHPrivateKeyFile),
+												WithPath(constants.MPISSHPrivateKeyFile).
+												WithMode(constants.MPISSHPrivateKeyFileMode),
 											corev1ac.KeyToPath().
 												WithKey(constants.MPISSHPublicKey).
-												WithPath(constants.MPISSHPublicKeyFile),
+												WithPath(constants.MPISSHPublicKeyFile).
+												WithMode(constants.MPISSHPublicKeyFileMode),
 											corev1ac.KeyToPath().
 												WithKey(constants.MPISSHPublicKey).
-												WithPath(constants.MPISSHAuthorizedKeys),
+												WithPath(constants.MPISSHAuthorizedKeys).
+												WithMode(constants.MPISSHPublicKeyFileMode),
 										),
 									),
 							},
@@ -274,16 +282,20 @@ trainJob-node-1-1.trainJob slots=1
 									WithName(constants.MPISSHAuthVolumeName).
 									WithSecret(corev1ac.SecretVolumeSource().
 										WithSecretName(fmt.Sprintf("trainJob%s", constants.MPISSHAuthSecretSuffix)).
+										WithDefaultMode(constants.MPISSHAuthDefaultMode).
 										WithItems(
 											corev1ac.KeyToPath().
 												WithKey(corev1.SSHAuthPrivateKey).
-												WithPath(constants.MPISSHPrivateKeyFile),
+												WithPath(constants.MPISSHPrivateKeyFile).
+												WithMode(constants.MPISSHPrivateKeyFileMode),
 											corev1ac.KeyToPath().
 												WithKey(constants.MPISSHPublicKey).
-												WithPath(constants.MPISSHPublicKeyFile),
+												WithPath(constants.MPISSHPublicKeyFile).
+												WithMode(constants.MPISSHPublicKeyFileMode),
 											corev1ac.KeyToPath().
 												WithKey(constants.MPISSHPublicKey).
-												WithPath(constants.MPISSHAuthorizedKeys),
+												WithPath(constants.MPISSHAuthorizedKeys).
+												WithMode(constants.MPISSHPublicKeyFileMode),
 										),
 									),
 								*corev1ac.Volume().
@@ -311,16 +323,20 @@ trainJob-node-1-1.trainJob slots=1
 									WithName(constants.MPISSHAuthVolumeName).
 									WithSecret(corev1ac.SecretVolumeSource().
 										WithSecretName(fmt.Sprintf("trainJob%s", constants.MPISSHAuthSecretSuffix)).
+										WithDefaultMode(constants.MPISSHAuthDefaultMode).
 										WithItems(
 											corev1ac.KeyToPath().
 												WithKey(corev1.SSHAuthPrivateKey).
-												WithPath(constants.MPISSHPrivateKeyFile),
+												WithPath(constants.MPISSHPrivateKeyFile).
+												WithMode(constants.MPISSHPrivateKeyFileMode),
 											corev1ac.KeyToPath().
 												WithKey(constants.MPISSHPublicKey).
-												WithPath(constants.MPISSHPublicKeyFile),
+												WithPath(constants.MPISSHPublicKeyFile).
+												WithMode(constants.MPISSHPublicKeyFileMode),
 											corev1ac.KeyToPath().
 												WithKey(constants.MPISSHPublicKey).
-												WithPath(constants.MPISSHAuthorizedKeys),
+												WithPath(constants.MPISSHAuthorizedKeys).
+												WithMode(constants.MPISSHPublicKeyFileMode),
 										),
 									),
 							},
@@ -411,16 +427,20 @@ trainJob-node-1-1.trainJob slots=1
 									WithName(constants.MPISSHAuthVolumeName).
 									WithSecret(corev1ac.SecretVolumeSource().
 										WithSecretName(fmt.Sprintf("trainJob%s", constants.MPISSHAuthSecretSuffix)).
+										WithDefaultMode(constants.MPISSHAuthDefaultMode).
 										WithItems(
 											corev1ac.KeyToPath().
 												WithKey(corev1.SSHAuthPrivateKey).
-												WithPath(constants.MPISSHPrivateKeyFile),
+												WithPath(constants.MPISSHPrivateKeyFile).
+												WithMode(constants.MPISSHPrivateKeyFileMode),
 											corev1ac.KeyToPath().
 												WithKey(constants.MPISSHPublicKey).
-												WithPath(constants.MPISSHPublicKeyFile),
+												WithPath(constants.MPISSHPublicKeyFile).
+												WithMode(constants.MPISSHPublicKeyFileMode),
 											corev1ac.KeyToPath().
 												WithKey(constants.MPISSHPublicKey).
-												WithPath(constants.MPISSHAuthorizedKeys),
+												WithPath(constants.MPISSHAuthorizedKeys).
+												WithMode(constants.MPISSHPublicKeyFileMode),
 										),
 									),
 								*corev1ac.Volume().
@@ -448,16 +468,20 @@ trainJob-node-1-1.trainJob slots=1
 									WithName(constants.MPISSHAuthVolumeName).
 									WithSecret(corev1ac.SecretVolumeSource().
 										WithSecretName(fmt.Sprintf("trainJob%s", constants.MPISSHAuthSecretSuffix)).
+										WithDefaultMode(constants.MPISSHAuthDefaultMode).
 										WithItems(
 											corev1ac.KeyToPath().
 												WithKey(corev1.SSHAuthPrivateKey).
-												WithPath(constants.MPISSHPrivateKeyFile),
+												WithPath(constants.MPISSHPrivateKeyFile).
+												WithMode(constants.MPISSHPrivateKeyFileMode),
 											corev1ac.KeyToPath().
 												WithKey(constants.MPISSHPublicKey).
-												WithPath(constants.MPISSHPublicKeyFile),
+												WithPath(constants.MPISSHPublicKeyFile).
+												WithMode(constants.MPISSHPublicKeyFileMode),
 											corev1ac.KeyToPath().
 												WithKey(constants.MPISSHPublicKey).
-												WithPath(constants.MPISSHAuthorizedKeys),
+												WithPath(constants.MPISSHAuthorizedKeys).
+												WithMode(constants.MPISSHPublicKeyFileMode),
 										),
 									),
 							},
@@ -579,16 +603,20 @@ trainJob-node-1-1.trainJob slots=1
 									WithName(constants.MPISSHAuthVolumeName).
 									WithSecret(corev1ac.SecretVolumeSource().
 										WithSecretName(fmt.Sprintf("trainJob%s", constants.MPISSHAuthSecretSuffix)).
+										WithDefaultMode(constants.MPISSHAuthDefaultMode).
 										WithItems(
 											corev1ac.KeyToPath().
 												WithKey(corev1.SSHAuthPrivateKey).
-												WithPath(constants.MPISSHPrivateKeyFile),
+												WithPath(constants.MPISSHPrivateKeyFile).
+												WithMode(constants.MPISSHPrivateKeyFileMode),
 											corev1ac.KeyToPath().
 												WithKey(constants.MPISSHPublicKey).
-												WithPath(constants.MPISSHPublicKeyFile),
+												WithPath(constants.MPISSHPublicKeyFile).
+												WithMode(constants.MPISSHPublicKeyFileMode),
 											corev1ac.KeyToPath().
 												WithKey(constants.MPISSHPublicKey).
-												WithPath(constants.MPISSHAuthorizedKeys),
+												WithPath(constants.MPISSHAuthorizedKeys).
+												WithMode(constants.MPISSHPublicKeyFileMode),
 										),
 									),
 								*corev1ac.Volume().
@@ -624,16 +652,20 @@ trainJob-node-1-1.trainJob slots=1
 									WithName(constants.MPISSHAuthVolumeName).
 									WithSecret(corev1ac.SecretVolumeSource().
 										WithSecretName(fmt.Sprintf("trainJob%s", constants.MPISSHAuthSecretSuffix)).
+										WithDefaultMode(constants.MPISSHAuthDefaultMode).
 										WithItems(
 											corev1ac.KeyToPath().
 												WithKey(corev1.SSHAuthPrivateKey).
-												WithPath(constants.MPISSHPrivateKeyFile),
+												WithPath(constants.MPISSHPrivateKeyFile).
+												WithMode(constants.MPISSHPrivateKeyFileMode),
 											corev1ac.KeyToPath().
 												WithKey(constants.MPISSHPublicKey).
-												WithPath(constants.MPISSHPublicKeyFile),
+												WithPath(constants.MPISSHPublicKeyFile).
+												WithMode(constants.MPISSHPublicKeyFileMode),
 											corev1ac.KeyToPath().
 												WithKey(constants.MPISSHPublicKey).
-												WithPath(constants.MPISSHAuthorizedKeys),
+												WithPath(constants.MPISSHAuthorizedKeys).
+												WithMode(constants.MPISSHPublicKeyFileMode),
 										),
 									),
 							},
@@ -707,16 +739,20 @@ trainJob-node-1-0.trainJob slots=1
 									WithName(constants.MPISSHAuthVolumeName).
 									WithSecret(corev1ac.SecretVolumeSource().
 										WithSecretName(fmt.Sprintf("trainJob%s", constants.MPISSHAuthSecretSuffix)).
+										WithDefaultMode(constants.MPISSHAuthDefaultMode).
 										WithItems(
 											corev1ac.KeyToPath().
 												WithKey(corev1.SSHAuthPrivateKey).
-												WithPath(constants.MPISSHPrivateKeyFile),
+												WithPath(constants.MPISSHPrivateKeyFile).
+												WithMode(constants.MPISSHPrivateKeyFileMode),
 											corev1ac.KeyToPath().
 												WithKey(constants.MPISSHPublicKey).
-												WithPath(constants.MPISSHPublicKeyFile),
+												WithPath(constants.MPISSHPublicKeyFile).
+												WithMode(constants.MPISSHPublicKeyFileMode),
 											corev1ac.KeyToPath().
 												WithKey(constants.MPISSHPublicKey).
-												WithPath(constants.MPISSHAuthorizedKeys),
+												WithPath(constants.MPISSHAuthorizedKeys).
+												WithMode(constants.MPISSHPublicKeyFileMode),
 										),
 									),
 								*corev1ac.Volume().
@@ -790,16 +826,20 @@ trainJob-node-1-0.trainJob slots=1
 									WithName(constants.MPISSHAuthVolumeName).
 									WithSecret(corev1ac.SecretVolumeSource().
 										WithSecretName(fmt.Sprintf("trainJob%s", constants.MPISSHAuthSecretSuffix)).
+										WithDefaultMode(constants.MPISSHAuthDefaultMode).
 										WithItems(
 											corev1ac.KeyToPath().
 												WithKey(corev1.SSHAuthPrivateKey).
-												WithPath(constants.MPISSHPrivateKeyFile),
+												WithPath(constants.MPISSHPrivateKeyFile).
+												WithMode(constants.MPISSHPrivateKeyFileMode),
 											corev1ac.KeyToPath().
 												WithKey(constants.MPISSHPublicKey).
-												WithPath(constants.MPISSHPublicKeyFile),
+												WithPath(constants.MPISSHPublicKeyFile).
+												WithMode(constants.MPISSHPublicKeyFileMode),
 											corev1ac.KeyToPath().
 												WithKey(constants.MPISSHPublicKey).
-												WithPath(constants.MPISSHAuthorizedKeys),
+												WithPath(constants.MPISSHAuthorizedKeys).
+												WithMode(constants.MPISSHPublicKeyFileMode),
 										),
 									),
 								*corev1ac.Volume().
@@ -986,6 +1026,77 @@ func TestValidate(t *testing.T) {
 			wantError: field.ErrorList{
 				field.Invalid(field.NewPath("spec").Child("trainer", "numNodes"), ptr.To(int32(2)), "must have 1 when MPI trainingRuntime with enabled runLauncherAsNode does not have either launcher and node"),
 			},
+		},
+		"trainer has reserved MPI env OMPI_MCA_orte_default_hostfile": {
+			info: runtime.NewInfo(
+				runtime.WithMLPolicySource(utiltesting.MakeMLPolicyWrapper().
+					WithMLPolicySource(*utiltesting.MakeMLPolicySourceWrapper().
+						MPIPolicy(ptr.To[int32](1), trainer.MPIImplementationOpenMPI, nil, nil).
+						Obj(),
+					).
+					Obj(),
+				),
+			),
+			newObj: utiltesting.MakeTrainJobWrapper(metav1.NamespaceDefault, "test").
+				Trainer(utiltesting.MakeTrainJobTrainerWrapper().
+					Env(corev1.EnvVar{Name: constants.OpenMPIEnvHostFileLocation, Value: "/custom/hostfile"}).
+					Obj(),
+				).
+				Obj(),
+			wantError: field.ErrorList{
+				field.Invalid(
+					field.NewPath("spec").Child("trainer").Child("env"),
+					[]corev1.EnvVar{{Name: constants.OpenMPIEnvHostFileLocation, Value: "/custom/hostfile"}},
+					fmt.Sprintf("must not have reserved envs, invalid envs configured: %v", []string{constants.OpenMPIEnvHostFileLocation}),
+				),
+			},
+		},
+		"trainer has multiple reserved MPI envs": {
+			info: runtime.NewInfo(
+				runtime.WithMLPolicySource(utiltesting.MakeMLPolicyWrapper().
+					WithMLPolicySource(*utiltesting.MakeMLPolicySourceWrapper().
+						MPIPolicy(ptr.To[int32](1), trainer.MPIImplementationOpenMPI, nil, nil).
+						Obj(),
+					).
+					Obj(),
+				),
+			),
+			newObj: utiltesting.MakeTrainJobWrapper(metav1.NamespaceDefault, "test").
+				Trainer(utiltesting.MakeTrainJobTrainerWrapper().
+					Env(
+						corev1.EnvVar{Name: constants.OpenMPIEnvHostFileLocation, Value: "/custom/hostfile"},
+						corev1.EnvVar{Name: constants.OpenMPIEnvKeyRSHArgs, Value: "custom-args"},
+					).
+					Obj(),
+				).
+				Obj(),
+			wantError: field.ErrorList{
+				field.Invalid(
+					field.NewPath("spec").Child("trainer").Child("env"),
+					[]corev1.EnvVar{
+						{Name: constants.OpenMPIEnvHostFileLocation, Value: "/custom/hostfile"},
+						{Name: constants.OpenMPIEnvKeyRSHArgs, Value: "custom-args"},
+					},
+					fmt.Sprintf("must not have reserved envs, invalid envs configured: %v", []string{constants.OpenMPIEnvHostFileLocation, constants.OpenMPIEnvKeyRSHArgs}),
+				),
+			},
+		},
+		"trainer has non-reserved env is valid": {
+			info: runtime.NewInfo(
+				runtime.WithMLPolicySource(utiltesting.MakeMLPolicyWrapper().
+					WithMLPolicySource(*utiltesting.MakeMLPolicySourceWrapper().
+						MPIPolicy(ptr.To[int32](1), trainer.MPIImplementationOpenMPI, nil, nil).
+						Obj(),
+					).
+					Obj(),
+				),
+			),
+			newObj: utiltesting.MakeTrainJobWrapper(metav1.NamespaceDefault, "test").
+				Trainer(utiltesting.MakeTrainJobTrainerWrapper().
+					Env(corev1.EnvVar{Name: "CUSTOM_ENV", Value: "custom-value"}).
+					Obj(),
+				).
+				Obj(),
 		},
 	}
 	for name, tc := range cases {

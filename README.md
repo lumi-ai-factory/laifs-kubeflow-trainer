@@ -14,8 +14,12 @@
 
 Latest News 🔥
 
+- [2026/03] Kubeflow Trainer v2.2 is officially released with support for JAX and XGBoost
+  Training Runtimes, enhanced observability with metrics propagation to TrainJob status,
+  and Flux Framework integration for HPC and MPI workloads. Check out
+  [the blog post announcement](https://blog.kubeflow.org/kubeflow-trainer-v2.2-release/).
 - [2025/11] Kubeflow Trainer v2.1 is officially released with support of
-  [Distributed Data Cache](https://www.kubeflow.org/docs/components/trainer/user-guides/data-cache/),
+  [Distributed Data Cache](https://trainer.kubeflow.org/en/latest/user-guides/data-cache.html),
   topology aware scheduling with Kueue and Volcano, and LLM post-training enhancements. Check out
   [the GitHub release notes](https://github.com/kubeflow/trainer/releases/tag/v2.1.0).
 - [2025/09] Kubeflow SDK v0.1 is officially released with support for CustomTrainer,
@@ -74,10 +78,9 @@ Additional talks:
 - [From High Performance Computing To AI Workloads on Kubernetes: MPI Runtime in Kubeflow TrainJob](https://youtu.be/Fnb1a5Kaxgo)
 - [Streamline LLM Fine-tuning on Kubernetes With Kubeflow LLM Trainer](https://youtu.be/O7cNlaz3Hqs)
 
-
 ## Getting Started
 
-Please check [the official Kubeflow Trainer documentation](https://www.kubeflow.org/docs/components/trainer/getting-started)
+Please check [the official Kubeflow Trainer documentation](https://trainer.kubeflow.org/en/latest/getting-started/index.html)
 to install and get started with Kubeflow Trainer.
 
 ## Community
@@ -94,17 +97,17 @@ Please refer to the [CONTRIBUTING guide](CONTRIBUTING.md).
 
 ## Changelog
 
-Please refer to the [CHANGELOG](CHANGELOG.md).
+Please refer to the [CHANGELOG](CHANGELOG/) directory.
 
 ## Kubeflow Training Operator V1
 
 Kubeflow Trainer project is currently in <strong>alpha</strong> status, and APIs may change.
-If you are using Kubeflow Training Operator V1, please refer [to this migration document](https://www.kubeflow.org/docs/components/trainer/operator-guides/migration/).
+If you are using Kubeflow Training Operator V1, please refer [to this migration document](https://trainer.kubeflow.org/en/latest/operator-guides/migration.html).
 
 Kubeflow Community will maintain the Training Operator V1 source code at
 [the `release-1.9` branch](https://github.com/kubeflow/trainer/tree/release-1.9).
 
-You can find the documentation for Kubeflow Training Operator V1 in [these guides](https://www.kubeflow.org/docs/components/trainer/legacy-v1).
+You can find the documentation for Kubeflow Training Operator V1 in [these guides](https://trainer.kubeflow.org/en/latest/legacy-v1/index.html).
 
 ## Acknowledgement
 
