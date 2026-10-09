@@ -2,22 +2,32 @@ package remote
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 
-	trainer "github.com/kubeflow/trainer/v2/pkg/apis/trainer/v1alpha1"
-	"github.com/kubeflow/trainer/v2/pkg/runtime"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apiruntime "k8s.io/apimachinery/pkg/runtime"
+	batchv1ac "k8s.io/client-go/applyconfigurations/batch/v1"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
+	"k8s.io/utils/ptr"
+	jobsetv1alpha2ac "sigs.k8s.io/jobset/client-go/applyconfiguration/jobset/v1alpha2"
+
+	trainer "github.com/kubeflow/trainer/v2/pkg/apis/trainer/v1alpha1"
+	"github.com/kubeflow/trainer/v2/pkg/constants"
+	"github.com/kubeflow/trainer/v2/pkg/runtime"
+	"github.com/kubeflow/trainer/v2/pkg/runtime/framework"
+	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/jobset"
+	testingutil "github.com/kubeflow/trainer/v2/pkg/util/testing"
 )
 
 // Helper to create Remote plugin instance
 func getRemotePlugin(t *testing.T) *Remote {
 	t.Helper()
 
-	plugin, err := New(context.TODO(), nil, nil)
+	plugin, err := New(context.TODO(), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to create plugin: %v", err)
 	}
@@ -173,5 +183,111 @@ EOM`,
 	// Accept both behaviors: skip or error, but must not panic.
 	if err != nil {
 		t.Logf("Build returned error (acceptable): %v", err)
+	}
+}
+
+// Ensures the trainer container runs the remote runner whether the remote plugin
+// runs before or after the JobSet plugin. The framework does not guarantee the
+// order of ComponentBuilder plugins.
+func TestBuild_IndependentOfJobSetPluginOrder(t *testing.T) {
+	cases := map[string]struct {
+		remoteFirst bool
+	}{
+		"remote plugin runs before the JobSet plugin": {remoteFirst: true},
+		"remote plugin runs after the JobSet plugin":  {remoteFirst: false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.TODO()
+
+			info := runtime.NewInfo(
+				runtime.WithTemplateSpecObjApply(jobsetv1alpha2ac.JobSetSpec().
+					WithReplicatedJobs(jobsetv1alpha2ac.ReplicatedJob().
+						WithName(constants.Node).
+						WithTemplate(batchv1ac.JobTemplateSpec().
+							WithLabels(map[string]string{constants.LabelTrainJobAncestor: constants.AncestorTrainer}).
+							WithSpec(batchv1ac.JobSpec().
+								WithTemplate(corev1ac.PodTemplateSpec().
+									WithSpec(corev1ac.PodSpec().
+										WithContainers(corev1ac.Container().
+											WithName(constants.Node).
+											WithImage("test:runtime")))))))),
+				runtime.WithPodSet(constants.Node, ptr.To(constants.AncestorTrainer), 1, corev1.PodSpec{}, corev1ac.PodSpec().
+					WithContainers(corev1ac.Container().WithName(constants.Node)),
+				),
+			)
+
+			job := &trainer.TrainJob{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "test-job",
+					Namespace:   metav1.NamespaceDefault,
+					Annotations: map[string]string{SlurmURIAnnotation: "https://slurm.example"},
+				},
+				Spec: trainer.TrainJobSpec{
+					RuntimeRef: trainer.RuntimeRef{
+						Name: Name,
+					},
+					Trainer: &trainer.Trainer{
+						Command: []string{
+							"bash",
+							"-c",
+							`read -r -d '' SCRIPT << EOM
+print("hi")
+EOM`,
+						},
+					},
+				},
+			}
+
+			c := testingutil.NewClientBuilder().Build()
+			jobSetPlugin, err := jobset.New(ctx, c, nil, nil)
+			if err != nil {
+				t.Fatalf("failed to create JobSet plugin: %v", err)
+			}
+			plugins := []framework.ComponentBuilderPlugin{
+				jobSetPlugin.(framework.ComponentBuilderPlugin),
+				getRemotePlugin(t),
+			}
+			if tc.remoteFirst {
+				slices.Reverse(plugins)
+			}
+
+			// Like the controller, inspect the objects only after all plugins have run.
+			var objs []apiruntime.ApplyConfiguration
+			for _, p := range plugins {
+				pluginObjs, err := p.Build(ctx, info, job)
+				if err != nil {
+					t.Fatalf("%s Build returned unexpected error: %v", p.Name(), err)
+				}
+				objs = append(objs, pluginObjs...)
+			}
+
+			var gotCommand, gotArgs []string
+			var gotScript string
+			for _, obj := range objs {
+				switch o := obj.(type) {
+				case *jobsetv1alpha2ac.JobSetApplyConfiguration:
+					for _, rJob := range o.Spec.ReplicatedJobs {
+						for _, container := range rJob.Template.Spec.Template.Spec.Containers {
+							if ptr.Deref(container.Name, "") == constants.Node {
+								gotCommand, gotArgs = container.Command, container.Args
+							}
+						}
+					}
+				case *corev1ac.ConfigMapApplyConfiguration:
+					gotScript = o.Data[ScriptKey]
+				}
+			}
+
+			if diff := cmp.Diff([]string{"python3", "/runner/firecrest_runner.py"}, gotCommand); len(diff) != 0 {
+				t.Errorf("Unexpected trainer command (-want,+got):\n%s", diff)
+			}
+			if len(gotArgs) != 0 {
+				t.Errorf("Unexpected trainer args: %v", gotArgs)
+			}
+			if diff := cmp.Diff(`print("hi")`, gotScript); len(diff) != 0 {
+				t.Errorf("Unexpected script in ConfigMap (-want,+got):\n%s", diff)
+			}
+		})
 	}
 }

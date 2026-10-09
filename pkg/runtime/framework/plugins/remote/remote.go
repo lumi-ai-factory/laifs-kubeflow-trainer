@@ -19,22 +19,21 @@ import (
 	"fmt"
 	"strings"
 
-	configapi "github.com/kubeflow/trainer/v2/pkg/apis/config/v1alpha1"
 	apiruntime "k8s.io/apimachinery/pkg/runtime"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	jobsetv1alpha2ac "sigs.k8s.io/jobset/client-go/applyconfiguration/jobset/v1alpha2"
 
+	configapi "github.com/kubeflow/trainer/v2/pkg/apis/config/v1alpha1"
 	trainer "github.com/kubeflow/trainer/v2/pkg/apis/trainer/v1alpha1"
 	"github.com/kubeflow/trainer/v2/pkg/runtime"
 	"github.com/kubeflow/trainer/v2/pkg/runtime/framework"
-
-	jobsetv1alpha2ac "sigs.k8s.io/jobset/client-go/applyconfiguration/jobset/v1alpha2"
 )
 
 const (
-	Name               = "remote"
-	ScriptKey          = "script.py"
-	SlurmURIAnnotation = "remote.trainer.kubeflow.org/slurm-uri"
+	Name                = "remote"
+	ScriptKey           = "script.py"
+	SlurmURIAnnotation  = "remote.trainer.kubeflow.org/slurm-uri"
 	ScriptURIAnnotation = "remote.trainer.kubeflow.org/script-uri"
 
 	ScriptVolumeName = "remote-script"
@@ -121,7 +120,7 @@ func (r *Remote) Build(
 ) ([]apiruntime.ApplyConfiguration, error) {
 
 	if job.Spec.RuntimeRef.Name != Name {
-    return nil, nil
+		return nil, nil
 	}
 
 	if info == nil || job == nil || job.Spec.Trainer == nil {
@@ -143,6 +142,13 @@ func (r *Remote) Build(
 		return nil, fmt.Errorf("failed to extract python from heredoc: %w", err)
 	}
 
+	// The JobSet plugin copies trainJob.Spec.Trainer.Command/Args into the trainer
+	// container, and plugin order is not guaranteed. Point the in-memory TrainJob at
+	// the runner too, so the result is the same whichever plugin runs first.
+	// The controller only patches TrainJob status, so this is never written back.
+	job.Spec.Trainer.Command = []string{"python3", "/runner/firecrest_runner.py"}
+	job.Spec.Trainer.Args = nil
+
 	cmName := fmt.Sprintf("%s-remote-script", job.Name)
 
 	cm := corev1ac.ConfigMap(cmName, job.Namespace).
@@ -160,7 +166,7 @@ func (r *Remote) Build(
 	jobSetSpec.WithFailurePolicy(
 		jobsetv1alpha2ac.FailurePolicy().
 			WithMaxRestarts(0),
-		)
+	)
 
 	for i := range jobSetSpec.ReplicatedJobs {
 		rJob := &jobSetSpec.ReplicatedJobs[i]
