@@ -2,7 +2,7 @@
 
 This repository implements a custom Kubeflow Trainer runtime that executes training jobs on an external HPC system instead of inside Kubernetes.
 
-It is built on top of a fork of Kubeflow Trainer (based on the latest stable release v2.1.0), in order to integrate a custom runtime plugin that enables remote execution via FirecREST.
+It is built on top of a fork of Kubeflow Trainer (based on the stable release v2.3.0), in order to integrate a custom runtime plugin that enables remote execution via FirecREST.
 
 The runtime is designed to be simple:
 - Kubernetes handles orchestration

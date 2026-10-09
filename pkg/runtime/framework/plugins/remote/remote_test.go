@@ -109,6 +109,41 @@ func TestBuild_IgnoresWhenWrongRuntime(t *testing.T) {
 	}
 }
 
+// Ensures SyncParallelCount succeeds and leaves the JobSet template unchanged.
+func TestSyncParallelCount(t *testing.T) {
+	cases := map[string]struct {
+		info *runtime.Info
+	}{
+		"nil info": {
+			info: nil,
+		},
+		"info with JobSet template and PodSet count": {
+			info: runtime.NewInfo(
+				runtime.WithTemplateSpecObjApply(jobsetv1alpha2ac.JobSetSpec().
+					WithReplicatedJobs(jobsetv1alpha2ac.ReplicatedJob().
+						WithName(constants.Node).
+						WithTemplate(batchv1ac.JobTemplateSpec().
+							WithSpec(batchv1ac.JobSpec())))),
+				runtime.WithPodSet(constants.Node, ptr.To(constants.AncestorTrainer), 3, corev1.PodSpec{}, corev1ac.PodSpec()),
+			),
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := getRemotePlugin(t).SyncParallelCount(tc.info); err != nil {
+				t.Fatalf("SyncParallelCount returned unexpected error: %v", err)
+			}
+			if tc.info == nil {
+				return
+			}
+			jobSetSpec, _ := runtime.TemplateSpecApply[jobsetv1alpha2ac.JobSetSpecApplyConfiguration](tc.info)
+			if got := jobSetSpec.ReplicatedJobs[0].Template.Spec.Parallelism; got != nil {
+				t.Errorf("Unexpected parallelism: %d", *got)
+			}
+		})
+	}
+}
+
 // Ensures heredoc Python extraction works correctly.
 func TestExtractPythonFromHeredoc(t *testing.T) {
 	input := `
@@ -252,7 +287,13 @@ EOM`,
 				slices.Reverse(plugins)
 			}
 
-			// Like the controller, inspect the objects only after all plugins have run.
+			// Like the controller, sync counts for all plugins before building,
+			// and inspect the objects only after all plugins have run.
+			for _, p := range plugins {
+				if err := p.SyncParallelCount(info); err != nil {
+					t.Fatalf("%s SyncParallelCount returned unexpected error: %v", p.Name(), err)
+				}
+			}
 			var objs []apiruntime.ApplyConfiguration
 			for _, p := range plugins {
 				pluginObjs, err := p.Build(ctx, info, job)

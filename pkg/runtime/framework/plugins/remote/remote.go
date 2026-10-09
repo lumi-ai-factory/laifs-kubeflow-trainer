@@ -55,6 +55,12 @@ func (r *Remote) Name() string {
 	return Name
 }
 
+// SyncParallelCount is a no-op: the JobSet plugin propagates PodSet counts
+// into the JobSet template, and the remote runtime does not change them.
+func (r *Remote) SyncParallelCount(_ *runtime.Info) error {
+	return nil
+}
+
 // extractPythonFromHeredoc extracts Python code from the Trainer SDK
 // heredoc wrapper:
 //
