@@ -357,14 +357,12 @@ func (j *JobSet) Build(ctx context.Context, info *runtime.Info, trainJob *traine
 	for psIdx, ps := range info.TemplateSpec.PodSets {
 		apply.UpsertVolumes(&jobSetSpec.ReplicatedJobs[psIdx].Template.Spec.Template.Spec.Volumes, ps.Volumes...)
 		for containerIdx, container := range ps.Containers {
-
 			if len(container.Command) > 0 {
 				jobSetSpec.ReplicatedJobs[psIdx].Template.Spec.Template.Spec.Containers[containerIdx].Command = container.Command
 			}
 			if container.Image != "" {
 				jobSetSpec.ReplicatedJobs[psIdx].Template.Spec.Template.Spec.Containers[containerIdx].Image = ptr.To(container.Image)
 			}
-
 			apply.UpsertEnvVars(
 				&jobSetSpec.ReplicatedJobs[psIdx].Template.Spec.Template.Spec.Containers[containerIdx].Env,
 				container.Env...,
