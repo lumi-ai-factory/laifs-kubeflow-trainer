@@ -65,8 +65,8 @@ def create_firecrest_client(fc_env):
 
 def collect_s3_env():
     keys = [
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
+        "S3_ACCESS_KEY",
+        "S3_SECRET_ACCESS_KEY",
         "S3_ENDPOINT_URL",
         "S3_REGION",
         ]
