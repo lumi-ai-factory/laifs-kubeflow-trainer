@@ -98,7 +98,7 @@ spec:
                       imagePullPolicy: Always
                       envFrom:
                         - secretRef:
-                            name: S3-secret
+                            name: s3-secret
                         - secretRef:
                             name: firecrest-secret
 ```
@@ -114,10 +114,10 @@ FIRECREST_MACHINE
 FIRECREST_REMOTE_PATH
 FIRECREST_ACCOUNT
 ```
-### S3-secret:
+### s3-secret:
 ```
-S3_ACCESS_KEY
-S3_SECRET_ACCESS_KEY
+AWS_ACCESS_KEY_ID
+AWS_SECRET_ACCESS_KEY
 S3_ENDPOINT_URL
 S3_REGION
 ```
