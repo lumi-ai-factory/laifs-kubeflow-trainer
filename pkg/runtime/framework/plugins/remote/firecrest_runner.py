@@ -83,25 +83,41 @@ def collect_s3_env():
     return env_vars
 
 def collect_mlflow_env():
-    keys = [
-        "MLFLOW_TRACKING_URI",
-        "MLFLOW_TRACKING_USERNAME",
-        "MLFLOW_TRACKING_PASSWORD",
-    ]
+    """URI and token for the project's own MLflow, or nothing if the token is not available."""
+    import requests
 
-    env_vars = {}
+    kubeflow_host = require_env("KUBEFLOW_HOST")
+    k8s_host = os.environ["KUBERNETES_SERVICE_HOST"]
+    k8s_port = os.environ["KUBERNETES_SERVICE_PORT"]
 
-    for key in keys:
-        value = os.environ.get(key)
-        if not value:
-            print(
-                f"ERROR: missing required MLflow env var '{key}'",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        env_vars[key] = value.strip()
+    namespace = open("/var/run/secrets/kubernetes.io/serviceaccount/namespace").read().strip()
+    token = open("/var/run/secrets/kubernetes.io/serviceaccount/token").read().strip()
 
-    return env_vars
+    # Token of the mlflow-client ServiceAccount, valid at the Kubeflow gateway only.
+    # It must last for the job's queue and run time.
+    url = f"https://{k8s_host}:{k8s_port}/api/v1/namespaces/{namespace}/serviceaccounts/mlflow-client/token"
+
+    payload = {
+        "apiVersion": "authentication.k8s.io/v1",
+        "kind": "TokenRequest",
+        "spec": {"audiences": ["kubeflow-mlflow"], "expirationSeconds": 48 * 3600},
+    }
+
+    try:
+        resp = requests.post(url,
+                             json=payload,
+                             headers={"Authorization": f"Bearer {token}"},
+                             verify="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+                             )
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"WARNING: no MLflow token, the job runs without MLflow: {e}")
+        return {}
+
+    return {
+        "MLFLOW_TRACKING_URI": f"https://{kubeflow_host}/mlflow/{namespace}/",
+        "MLFLOW_TRACKING_TOKEN": resp.json()["status"]["token"],
+    }
 
 def download_from_s3(uri: str, dst_path: Path) -> None:
     if not uri.startswith("s3://"):
@@ -299,6 +315,9 @@ def main():
             account=account,
             blocking=True,
         )
+
+        # .env holds the S3 keys and the MLflow token
+        client.chmod(machine, f"{job_dir}/.env", "600")
 
         print("Job files uploaded successfully.")
 
