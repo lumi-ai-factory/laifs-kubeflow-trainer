@@ -94,7 +94,6 @@ def collect_mlflow_env():
     token = open("/var/run/secrets/kubernetes.io/serviceaccount/token").read().strip()
 
     # Token of the mlflow-client ServiceAccount, valid at the Kubeflow gateway only.
-    # It must last for the job's queue and run time.
     url = f"https://{k8s_host}:{k8s_port}/api/v1/namespaces/{namespace}/serviceaccounts/mlflow-client/token"
 
     payload = {
