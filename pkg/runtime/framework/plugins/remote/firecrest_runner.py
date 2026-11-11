@@ -83,10 +83,14 @@ def collect_s3_env():
     return env_vars
 
 def collect_mlflow_env():
-    """URI and token for the project's own MLflow, or nothing if the token is not available."""
+    """URI and token for the project's own MLflow, or nothing if it is not available."""
     import requests
 
-    kubeflow_host = require_env("KUBEFLOW_HOST")
+    tracking_uri = os.environ.get("MLFLOW_TRACKING_URI")
+    if not tracking_uri:
+        print("WARNING: no MLflow in this project, the job runs without MLflow")
+        return {}
+
     k8s_host = os.environ["KUBERNETES_SERVICE_HOST"]
     k8s_port = os.environ["KUBERNETES_SERVICE_PORT"]
 
@@ -114,7 +118,7 @@ def collect_mlflow_env():
         return {}
 
     return {
-        "MLFLOW_TRACKING_URI": f"https://{kubeflow_host}/mlflow/{namespace}/",
+        "MLFLOW_TRACKING_URI": tracking_uri,
         "MLFLOW_TRACKING_TOKEN": resp.json()["status"]["token"],
     }
 
