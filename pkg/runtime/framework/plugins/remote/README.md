@@ -1,68 +1,30 @@
 # Remote Trainer Runtime (HPC via FirecREST)
 
-This repository implements a custom Kubeflow Trainer runtime that executes training jobs on an external HPC system instead of inside Kubernetes.
+A custom Kubeflow Trainer runtime that runs training jobs on an HPC system via FirecREST instead of
+inside Kubernetes. It is built on a fork of Kubeflow Trainer v2.2.0.
 
-It is built on top of a fork of Kubeflow Trainer (based on the latest stable release v2.1.0), in order to integrate a custom runtime plugin that enables remote execution via FirecREST.
+Developed by LUMI AI Factory and used to run training jobs from Kubeflow on LUMI.
 
 The runtime is designed to be simple:
 - Kubernetes handles orchestration
 - Actual compute runs on HPC via FirecREST
 - Minimal components, minimal complexity
 
-## Overview
-
-Unlike standard Kubeflow runtimes that execute workloads inside Kubernetes, this runtime:
-
-1. Retrieves the training script:
-   - either by extracting it from the Trainer SDK command
-   - or by downloading it from S3 via a provided annotation
-   - the SLURM submission script is also fetched from S3
-2. Passes it to a lightweight runner container
-3. The runner submits and monitors the job on HPC via FirecREST
-4. Logs are fetched from the remote system
-5. The TrainJob status reflects the HPC job outcome
-
 ## Repository Structure
 
-- `remote.go`
-  Runtime plugin implementation.
-  Modifies the generated JobSet:
-  - injects runner container
-  - mounts training script
-  - sets environment variables
-  - disables retries via FailurePolicy
+- `remote.go`: runtime plugin, built into the custom `trainer-controller-manager` image. It modifies the
+  generated JobSet:
+  - stores the inline training script in a ConfigMap and mounts it, or passes the S3 script URI
+  - passes the annotations and the TrainJob name as environment variables
+  - runs the runner instead of the training command
+  - disables retries (FailurePolicy `MaxRestarts=0`)
+- `firecrest_runner.py`: the runner. It submits and follows the job on HPC (see Execution Flow).
+- `Dockerfile`: builds the runner image.
+- `remote_test.go`: unit tests for the plugin.
 
-- `firecrest_runner.py`
-  Executes the job on HPC:
-  - downloads scripts from S3
-  - uploads files to HPC
-  - submits SLURM job via FirecREST
-  - waits for completion
-  - fetches logs
-  - annotates TrainJob with job ID
+## Runtime Definition
 
-- `Dockerfile`
-  Builds the runner image
-
-- `remote_test.go`
-  Unit tests for plugin behavior
-
-## Architecture
-
-This runtime consists of two parts:
-
-### 1. Runtime plugin
-
-Built into a custom `trainer-controller-manager` image.
-
-Responsible for:
-- modifying JobSet templates
-- injecting runner execution
-- wiring configuration into the pod
-
-### 2. Kubernetes runtime definition
-
-The runtime is exposed via a `ClusterTrainingRuntime` resource:
+The runtime is exposed as a `ClusterTrainingRuntime`, deployed with the Kubeflow setup:
 
 ```yaml
 apiVersion: trainer.kubeflow.org/v1alpha1
@@ -89,6 +51,7 @@ spec:
                     sidecar.istio.io/inject: "false"
                 spec:
                   restartPolicy: Never
+                  serviceAccountName: default-editor
                   containers:
                     - name: node
                       image: <your-runner-image>
@@ -101,96 +64,86 @@ spec:
                             name: s3-secret
                         - secretRef:
                             name: firecrest-secret
+                        - configMapRef:
+                            name: mlflow-client
+                            optional: true
 ```
-This resource is typically deployed as part of a Kubeflow setup (e.g. via Kustomize overlays), together with required images and secrets (described below).
 
-## Required Environment Variables
-These are provided via Kubernetes Secrets, which are pointed to in remote.yaml example above:
-### firecrest-secret:
-```
-FIRECREST_URL
-FIRECREST_TOKEN
-FIRECREST_MACHINE
-FIRECREST_REMOTE_PATH
-FIRECREST_ACCOUNT
-```
-### s3-secret:
-```
-AWS_ACCESS_KEY_ID
-AWS_SECRET_ACCESS_KEY
-S3_ENDPOINT_URL
-S3_REGION
-```
+## Configuration
+
+Provided by the Secrets and the ConfigMap referenced above:
+
+| Source | Variables |
+|---|---|
+| `firecrest-secret` | `FIRECREST_URL`, `FIRECREST_TOKEN`, `FIRECREST_MACHINE`, `FIRECREST_REMOTE_PATH`, `FIRECREST_ACCOUNT` |
+| `s3-secret` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `S3_ENDPOINT_URL`, `S3_REGION` |
+| `mlflow-client` ConfigMap (optional) | `MLFLOW_TRACKING_URI` |
+
+### MLflow (optional)
+
+If the namespace has the `mlflow-client` ConfigMap, the runner requests a 48 h token for the `mlflow-client`
+ServiceAccount and passes `MLFLOW_TRACKING_URI` and `MLFLOW_TRACKING_TOKEN` to the job. The runner's
+ServiceAccount must be allowed to create these tokens.
 
 ## Usage
 
-The remote runtime is used like any other Trainer runtime.
+The training script is given either inline as a Python function (Trainer SDK) or from S3 with the
+`script-uri` annotation. The SLURM script always comes from S3.
 
-The training script can be provided in two ways:
-
-- **Inline**, as a Python function (via the Trainer SDK)
-- **From S3**, by specifying a script URI using an annotation
-    - Some dummy script must be given as func to Trainer SDK, for example:
-    ```python
-    def dummy():
-        pass
-    ````
-
-In both cases, a SLURM submission script must be provided via S3 as an annotation.
-
-### Example (Python client)
+| Annotation | |
+|---|---|
+| `remote.trainer.kubeflow.org/slurm-uri` | S3 URI of the SLURM script (required) |
+| `remote.trainer.kubeflow.org/script-uri` | S3 URI of the training script (optional, overrides the inline function) |
+| `remote.trainer.kubeflow.org/job-id` | Set by the runner: the SLURM job ID |
 
 ```python
-from kubeflow.trainer import TrainerClient
+from kubeflow.trainer import CustomTrainer, TrainerClient
 from kubeflow.trainer.options import Annotations
 
-job_id = TrainerClient().train(
-    runtime="remote",
+client = TrainerClient()
+job_id = client.train(
+    runtime=client.get_runtime("remote"),
     trainer=CustomTrainer(
-        func=dummy,
+        func=lambda *args, **kwargs: None,  # required by the SDK, ignored when script-uri is given
         num_nodes=1,
-        resources_per_node={
-            "cpu": 1,
-            "memory": "1Gi",
-        },
+        resources_per_node={"cpu": 1, "memory": "1Gi"},
     ),
     options=[
         Annotations({
-            "remote.trainer.kubeflow.org/slurm-uri": "s3://my-bucket/test-slurm.sh",
-            "remote.trainer.kubeflow.org/script-uri": "s3://my-bucket/test_script.py"
+            "remote.trainer.kubeflow.org/slurm-uri": "s3://my-bucket/slurm_script.sh",
+            "remote.trainer.kubeflow.org/script-uri": "s3://my-bucket/train.py",
         })
     ],
 )
 ```
+
+### SLURM script
+
+- Run `source .env` to get the S3 and MLflow variables.
+- Write the output to `firecrest-%j.out` and `firecrest-%j.err` (`#SBATCH --output`/`--error`); the runner
+  prints these files after the job.
+
 ## Execution Flow
-- User submits a TrainJob with runtime `remote`
-- Plugin modifies JobSet:
-    - injects runner
-    - mounts script
-- Runner starts inside the pod
-- Runner:
-    - downloads scripts from S3
-    - uploads them to HPC
-    - submits SLURM job via FirecREST
-    - waits for completion
-- Logs are fetched and printed
-- TrainJob status is updated
+
+1. The plugin modifies the JobSet and the runner pod starts.
+2. The runner downloads the SLURM script (and the training script, if `script-uri` is given) from S3.
+3. It requests the MLflow token and writes the S3 and MLflow variables to `.env`.
+4. It uploads the scripts and `.env` (readable by its owner only) to
+   `<FIRECREST_REMOTE_PATH>/kf_output/<date>/<time>_<id>/` on HPC.
+5. It submits the SLURM job, sets the `job-id` annotation and waits for completion.
+6. If the job completed, it prints the job's output; otherwise the TrainJob fails.
 
 ## Failure Behavior
-- JobSet retries are disabled (FailurePolicy: MaxRestarts=0)
-- If the HPC job fails → TrainJob fails
-    - No automatic retries → User must inspect logs and resubmit
+
+- No retries: if the HPC job fails, the TrainJob fails, and the user must inspect the logs and resubmit.
+- Without the `slurm-uri` annotation, the TrainJob does not start (the plugin returns an error).
+- Without the MLflow ConfigMap or token, the job runs without MLflow (warning in the runner log).
 
 ## Notes
 
-- If the Kubernetes pod terminates, the HPC job continues independently
-- The system does not currently reattach to running HPC jobs
-- The HPC job ID is stored as a TrainJob annotation for traceability
+- If the Kubernetes pod terminates, the HPC job continues independently.
+- The runtime does not reattach to running HPC jobs.
 
 ## Status
 
-This project is a work in progress.
-
-The core functionality is implemented and has been used in test workflows, but the runtime is still evolving and may change.
-
-Some features and edge cases (e.g. reconnecting to running jobs) are not yet implemented.
+Work in progress: the core functionality is used in test workflows, but the runtime may still change.
