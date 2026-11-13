@@ -120,8 +120,7 @@ job_id = client.train(
 ### SLURM script
 
 - Run `source .env` to get the S3 and MLflow variables.
-- Write the output to `firecrest-%j.out` and `firecrest-%j.err` (`#SBATCH --output`/`--error`); the runner
-  prints these files after the job.
+- Write the output to `firecrest-%j.out` and `firecrest-%j.err` (`#SBATCH --output`/`--error`).
 
 ## Execution Flow
 
