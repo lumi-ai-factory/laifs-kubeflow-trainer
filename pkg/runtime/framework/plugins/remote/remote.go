@@ -11,6 +11,9 @@
 //
 // Optionally, a SLURM endpoint/URI can be passed to the runner via a TrainJob
 // annotation and injected as an environment variable.
+//
+// The credentials annotation names the Secret ("lumi-...") in the TrainJob's namespace
+// whose HPC and S3 credentials the job uses.
 
 package remote
 
@@ -20,6 +23,7 @@ import (
 	"strings"
 
 	apiruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	jobsetv1alpha2ac "sigs.k8s.io/jobset/client-go/applyconfiguration/jobset/v1alpha2"
@@ -35,6 +39,10 @@ const (
 	ScriptKey           = "script.py"
 	SlurmURIAnnotation  = "remote.trainer.kubeflow.org/slurm-uri"
 	ScriptURIAnnotation = "remote.trainer.kubeflow.org/script-uri"
+	// CredentialsAnnotation names the credential Secret, e.g. a user's ("lumi-jane-doe-example-org") or a robot account's.
+	CredentialsAnnotation = "remote.trainer.kubeflow.org/credentials"
+	// CredentialsSecretPrefix limits the annotation to credential Secrets, not any Secret in the namespace.
+	CredentialsSecretPrefix = "lumi-"
 
 	ScriptVolumeName = "remote-script"
 	ScriptMountDir   = "/mnt/remote"
@@ -107,6 +115,24 @@ func upsertEnvVar(env []corev1ac.EnvVarApplyConfiguration, name, value string) [
 	)
 }
 
+// credentialsSecret returns the name of the Secret holding the job's FirecREST and S3 credentials.
+// There is no default: a job without the annotation must not run with someone else's credentials.
+func credentialsSecret(job *trainer.TrainJob) (string, error) {
+	name := strings.TrimSpace(job.Annotations[CredentialsAnnotation])
+	if name == "" {
+		return "", fmt.Errorf("remote-runtime: required annotation %q is missing", CredentialsAnnotation)
+	}
+	if !strings.HasPrefix(name, CredentialsSecretPrefix) {
+		return "", fmt.Errorf("remote-runtime: annotation %q must name a Secret starting with %q, got %q",
+			CredentialsAnnotation, CredentialsSecretPrefix, name)
+	}
+	if errs := validation.IsDNS1123Label(name); len(errs) > 0 {
+		return "", fmt.Errorf("remote-runtime: annotation %q gives an invalid Secret name %q: %s",
+			CredentialsAnnotation, name, strings.Join(errs, "; "))
+	}
+	return name, nil
+}
+
 // Build customizes the generated JobSet so that training is executed
 // outside Kubernetes by these step:
 //  1. extracts the inline Python script produced by the Trainer SDK
@@ -163,6 +189,11 @@ func (r *Remote) Build(
 		return nil, nil
 	}
 
+	secretName, err := credentialsSecret(job)
+	if err != nil {
+		return nil, err
+	}
+
 	jobSetSpec.WithFailurePolicy(
 		jobsetv1alpha2ac.FailurePolicy().
 			WithMaxRestarts(0),
@@ -205,6 +236,12 @@ func (r *Remote) Build(
 					*corev1ac.VolumeMount().
 						WithName(ScriptVolumeName).
 						WithMountPath(ScriptMountDir),
+				)
+
+				// FirecREST and S3 credentials of the chosen credential set
+				c.EnvFrom = append(c.EnvFrom,
+					*corev1ac.EnvFromSource().
+						WithSecretRef(corev1ac.SecretEnvSource().WithName(secretName)),
 				)
 
 				// SLURM_URI (required)

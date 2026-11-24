@@ -16,6 +16,7 @@ The runtime is designed to be simple:
   generated JobSet:
   - stores the inline training script in a ConfigMap and mounts it, or passes the S3 script URI
   - passes the annotations and the TrainJob name as environment variables
+  - adds the credential Secret named in the `credentials` annotation (`envFrom`)
   - runs the runner instead of the training command
   - disables retries (FailurePolicy `MaxRestarts=0`)
 - `firecrest_runner.py`: the runner. It submits and follows the job on HPC (see Execution Flow).
@@ -59,11 +60,8 @@ spec:
                         - python3
                         - /runner/firecrest_runner.py
                       imagePullPolicy: Always
+                      # The credential Secret is added by the plugin
                       envFrom:
-                        - secretRef:
-                            name: s3-secret
-                        - secretRef:
-                            name: firecrest-secret
                         - configMapRef:
                             name: mlflow-client
                             optional: true
@@ -71,13 +69,17 @@ spec:
 
 ## Configuration
 
-Provided by the Secrets and the ConfigMap referenced above:
-
 | Source | Variables |
 |---|---|
-| `firecrest-secret` | `FIRECREST_URL`, `FIRECREST_TOKEN`, `FIRECREST_MACHINE`, `FIRECREST_REMOTE_PATH`, `FIRECREST_ACCOUNT` |
-| `s3-secret` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `S3_ENDPOINT_URL`, `S3_REGION` |
+| Secret named in the `credentials` annotation | `FIRECREST_URL`, `FIRECREST_TOKEN`, `FIRECREST_MACHINE`, `FIRECREST_REMOTE_PATH`, `FIRECREST_ACCOUNT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `S3_ENDPOINT_URL`, `S3_REGION` |
 | `mlflow-client` ConfigMap (optional) | `MLFLOW_TRACKING_URI` |
+
+### Credentials
+
+Each job names its credential Secret with the `credentials` annotation, and the plugin adds that Secret from the
+TrainJob's namespace to the runner. The job runs on HPC as the owner of its FirecREST token. A credential Secret
+belongs to one user (e.g. `lumi-jane-doe-example-org`) or, later, to a robot account (`lumi-robot`). Only names
+starting with `lumi-` are accepted. There is no default: without the annotation the TrainJob does not start.
 
 ### MLflow (optional)
 
@@ -94,6 +96,7 @@ The training script is given either inline as a Python function (Trainer SDK) or
 |---|---|
 | `remote.trainer.kubeflow.org/slurm-uri` | S3 URI of the SLURM script (required) |
 | `remote.trainer.kubeflow.org/script-uri` | S3 URI of the training script (optional, overrides the inline function) |
+| `remote.trainer.kubeflow.org/credentials` | Credential Secret, `lumi-...` (required) |
 | `remote.trainer.kubeflow.org/job-id` | Set by the runner: the SLURM job ID |
 
 ```python
@@ -112,6 +115,7 @@ job_id = client.train(
         Annotations({
             "remote.trainer.kubeflow.org/slurm-uri": "s3://my-bucket/slurm_script.sh",
             "remote.trainer.kubeflow.org/script-uri": "s3://my-bucket/train.py",
+            "remote.trainer.kubeflow.org/credentials": "lumi-jane-doe-example-org",
         })
     ],
 )
@@ -135,7 +139,8 @@ job_id = client.train(
 ## Failure Behavior
 
 - No retries: if the HPC job fails, the TrainJob fails, and the user must inspect the logs and resubmit.
-- Without the `slurm-uri` annotation, the TrainJob does not start (the plugin returns an error).
+- Without the `slurm-uri` or `credentials` annotation, the TrainJob does not start (the plugin returns an error).
+- If the credential Secret does not exist, the runner pod does not start (`CreateContainerConfigError`).
 - Without the MLflow ConfigMap or token, the job runs without MLflow (warning in the runner log).
 
 ## Notes

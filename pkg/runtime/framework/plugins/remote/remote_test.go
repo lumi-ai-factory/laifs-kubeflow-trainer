@@ -219,9 +219,12 @@ func TestBuild_IndependentOfJobSetPluginOrder(t *testing.T) {
 
 			job := &trainer.TrainJob{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:        "test-job",
-					Namespace:   metav1.NamespaceDefault,
-					Annotations: map[string]string{SlurmURIAnnotation: "https://slurm.example"},
+					Name:      "test-job",
+					Namespace: metav1.NamespaceDefault,
+					Annotations: map[string]string{
+						SlurmURIAnnotation:    "https://slurm.example",
+						CredentialsAnnotation: "lumi-jane-doe",
+					},
 				},
 				Spec: trainer.TrainJobSpec{
 					RuntimeRef: trainer.RuntimeRef{
@@ -263,6 +266,7 @@ EOM`,
 			}
 
 			var gotCommand, gotArgs []string
+			var gotEnvFrom []corev1ac.EnvFromSourceApplyConfiguration
 			var gotScript string
 			for _, obj := range objs {
 				switch o := obj.(type) {
@@ -271,6 +275,7 @@ EOM`,
 						for _, container := range rJob.Template.Spec.Template.Spec.Containers {
 							if ptr.Deref(container.Name, "") == constants.Node {
 								gotCommand, gotArgs = container.Command, container.Args
+								gotEnvFrom = container.EnvFrom
 							}
 						}
 					}
@@ -287,6 +292,43 @@ EOM`,
 			}
 			if diff := cmp.Diff(`print("hi")`, gotScript); len(diff) != 0 {
 				t.Errorf("Unexpected script in ConfigMap (-want,+got):\n%s", diff)
+			}
+			wantEnvFrom := []corev1ac.EnvFromSourceApplyConfiguration{
+				*corev1ac.EnvFromSource().WithSecretRef(corev1ac.SecretEnvSource().WithName("lumi-jane-doe")),
+			}
+			if diff := cmp.Diff(wantEnvFrom, gotEnvFrom); len(diff) != 0 {
+				t.Errorf("Unexpected envFrom (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// Ensures a job only runs with the credential set it names, and never without one.
+func TestCredentialsSecret(t *testing.T) {
+	cases := map[string]struct {
+		annotations map[string]string
+		want        string
+		wantErr     bool
+	}{
+		"user credential set":  {annotations: map[string]string{CredentialsAnnotation: "lumi-jane-doe-example-org"}, want: "lumi-jane-doe-example-org"},
+		"robot credential set": {annotations: map[string]string{CredentialsAnnotation: "lumi-robot"}, want: "lumi-robot"},
+		"surrounding spaces":   {annotations: map[string]string{CredentialsAnnotation: " lumi-robot "}, want: "lumi-robot"},
+		"no annotations":       {annotations: nil, wantErr: true},
+		"other Secret":         {annotations: map[string]string{CredentialsAnnotation: "mlflow-server-secret"}, wantErr: true},
+		"prefix only":          {annotations: map[string]string{CredentialsAnnotation: "lumi-"}, wantErr: true},
+		"empty annotation":     {annotations: map[string]string{CredentialsAnnotation: ""}, wantErr: true},
+		"not a valid name":     {annotations: map[string]string{CredentialsAnnotation: "lumi-Jane.Doe@example.org"}, wantErr: true},
+		"name made too long":   {annotations: map[string]string{CredentialsAnnotation: "lumi-" + strings.Repeat("a", 60)}, wantErr: true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			job := &trainer.TrainJob{ObjectMeta: metav1.ObjectMeta{Annotations: tc.annotations}}
+			got, err := credentialsSecret(job)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("credentialsSecret() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if got != tc.want {
+				t.Errorf("credentialsSecret() = %q, want %q", got, tc.want)
 			}
 		})
 	}
