@@ -1,7 +1,7 @@
 # Remote Trainer Runtime (HPC via FirecREST)
 
 A custom Kubeflow Trainer runtime that runs training jobs on an HPC system via FirecREST instead of
-inside Kubernetes. It is built on a fork of Kubeflow Trainer v2.2.0.
+inside Kubernetes. It is built on a fork of Kubeflow Trainer v2.4.0.
 
 Developed by LUMI AI Factory and used to run training jobs from Kubeflow on LUMI.
 

@@ -255,6 +255,11 @@ EOM`,
 				slices.Reverse(plugins)
 			}
 
+			// Like the controller, let the JobSet plugin consolidate the runtime template before any Build.
+			if err := jobSetPlugin.(framework.PreComponentBuilderPlugin).PreBuildSync(info, job); err != nil {
+				t.Fatalf("JobSet PreBuildSync returned unexpected error: %v", err)
+			}
+
 			// Like the controller, inspect the objects only after all plugins have run.
 			var objs []apiruntime.ApplyConfiguration
 			for _, p := range plugins {

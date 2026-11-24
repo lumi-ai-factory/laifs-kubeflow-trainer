@@ -62,6 +62,7 @@ import (
 	jobsetplgconsts "github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/jobset/constants"
 	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/mpi"
 	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/plainml"
+	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/remote"
 	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/torch"
 	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/volcano"
 	"github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/xgboost"
@@ -95,6 +96,7 @@ func TestNew(t *testing.T) {
 					jobset.Name:       &jobset.JobSet{},
 					jax.Name:          &jax.Jax{},
 					xgboost.Name:      &xgboost.XGBoost{},
+					remote.Name:       &remote.Remote{},
 				},
 				enforceMLPlugins: []framework.EnforceMLPolicyPlugin{
 					&flux.Flux{},
@@ -133,6 +135,7 @@ func TestNew(t *testing.T) {
 					&volcano.Volcano{},
 					&jobset.JobSet{},
 					&mpi.MPI{},
+					&remote.Remote{},
 				},
 				componentDeleterPlugins: []framework.ComponentDeleterPlugin{
 					&volcano.Volcano{},
@@ -157,7 +160,7 @@ func TestNew(t *testing.T) {
 	}
 	cmpOpts := []cmp.Option{
 		cmp.AllowUnexported(Framework{}),
-		cmpopts.IgnoreUnexported(coscheduling.CoScheduling{}, flux.Flux{}, volcano.Volcano{}, mpi.MPI{}, plainml.PlainML{}, torch.Torch{}, jobset.JobSet{}, xgboost.XGBoost{}),
+		cmpopts.IgnoreUnexported(coscheduling.CoScheduling{}, flux.Flux{}, volcano.Volcano{}, mpi.MPI{}, plainml.PlainML{}, torch.Torch{}, jobset.JobSet{}, xgboost.XGBoost{}, remote.Remote{}),
 		cmpopts.IgnoreFields(flux.Flux{}, "client", "scheme"),
 		cmpopts.IgnoreFields(coscheduling.CoScheduling{}, "client"),
 		cmpopts.IgnoreFields(volcano.Volcano{}, "client"),
