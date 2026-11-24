@@ -1,0 +1,11 @@
+[project]
+name = "model-initializer"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "huggingface-hub>=2.3.0,<2.4",
+  "opendal>=0.47.12",
+]
+
+[tool.uv]
+package = false

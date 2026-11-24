@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Kubeflow Authors.
+Copyright The Kubeflow Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,27 +18,134 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	corev1 "k8s.io/api/core/v1"
+	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/klog/v2/ktesting"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	jobsetv1alpha2 "sigs.k8s.io/jobset/api/jobset/v1alpha2"
+	jobsetv1alpha2ac "sigs.k8s.io/jobset/client-go/applyconfiguration/jobset/v1alpha2"
 	schedulerpluginsv1alpha1 "sigs.k8s.io/scheduler-plugins/apis/scheduling/v1alpha1"
+	volcanov1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 
 	trainer "github.com/kubeflow/trainer/v2/pkg/apis/trainer/v1alpha1"
+	"github.com/kubeflow/trainer/v2/pkg/apply"
 	"github.com/kubeflow/trainer/v2/pkg/constants"
+	"github.com/kubeflow/trainer/v2/pkg/features"
+	jobruntimes "github.com/kubeflow/trainer/v2/pkg/runtime"
 	jobsetplgconsts "github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins/jobset/constants"
 	testingutil "github.com/kubeflow/trainer/v2/pkg/util/testing"
 )
 
+func torchTuneResWithCPU(gpu string) corev1.ResourceList {
+	return corev1.ResourceList{
+		corev1.ResourceCPU: resource.MustParse("1"),
+		"example.com/gpu":  resource.MustParse(gpu),
+	}
+}
+
+func wantJobSetWithMergedGPU(ns, name, uid string, requests corev1.ResourceList, gpu string) *jobsetv1alpha2.JobSet {
+	jobSet := testingutil.MakeJobSetWrapper(ns, name).
+		ControllerReference(trainer.SchemeGroupVersion.WithKind(trainer.TrainJobKind), name, uid).
+		Replicas(1, constants.DatasetInitializer, constants.ModelInitializer, constants.Node, constants.Launcher).
+		Parallelism(1, constants.DatasetInitializer, constants.ModelInitializer).
+		Completions(1, constants.DatasetInitializer, constants.ModelInitializer).
+		NumNodes(1).
+		Container(constants.Node, constants.Node, "test:runtime", []string{"runtime"}, []string{"runtime"}, requests).
+		Obj()
+	for i := range jobSet.Spec.ReplicatedJobs {
+		if jobSet.Spec.ReplicatedJobs[i].Name != constants.Node {
+			continue
+		}
+		for j := range jobSet.Spec.ReplicatedJobs[i].Template.Spec.Template.Spec.Containers {
+			container := &jobSet.Spec.ReplicatedJobs[i].Template.Spec.Template.Spec.Containers[j]
+			if container.Name != constants.Node {
+				continue
+			}
+			if container.Resources.Limits == nil {
+				container.Resources.Limits = corev1.ResourceList{}
+			}
+			container.Resources.Limits["nvidia.com/gpu"] = resource.MustParse(gpu)
+			return jobSet
+		}
+	}
+	return jobSet
+}
+
+// draTorchRuntimeSpec builds a Torch runtime whose node container requests CPU only, so
+// PET_NPROC_PER_NODE falls back to the CPU count ("1").
+func draTorchRuntimeSpec(requests corev1.ResourceList) *testingutil.TrainingRuntimeSpecWrapper {
+	return testingutil.MakeTrainingRuntimeSpecWrapper(testingutil.MakeTrainingRuntimeWrapper(metav1.NamespaceDefault, "test-runtime").Spec).
+		WithMLPolicy(
+			testingutil.MakeMLPolicyWrapper().
+				WithNumNodes(1).
+				WithMLPolicySource(*testingutil.MakeMLPolicySourceWrapper().
+					TorchPolicy().
+					Obj(),
+				).
+				Obj(),
+		).
+		Container(constants.Node, constants.Node, "test:runtime", []string{"runtime"}, []string{"runtime"}, requests)
+}
+
+// wantDRATorchJobSet builds the JobSet expected from draTorchRuntimeSpec with the given PET_NPROC_PER_NODE.
+func wantDRATorchJobSet(requests corev1.ResourceList, numProcPerNode string) *testingutil.JobSetWrapper {
+	return testingutil.MakeJobSetWrapper(metav1.NamespaceDefault, "test-job").
+		ControllerReference(trainer.SchemeGroupVersion.WithKind(trainer.TrainJobKind), "test-job", "uid").
+		Replicas(1, constants.DatasetInitializer, constants.ModelInitializer, constants.Node).
+		Parallelism(1, constants.DatasetInitializer, constants.ModelInitializer).
+		Completions(1, constants.DatasetInitializer, constants.ModelInitializer).
+		NumNodes(1).
+		Container(constants.Node, constants.Node, "test:runtime", []string{"runtime"}, []string{"runtime"}, requests).
+		ContainerTrainerPorts([]corev1.ContainerPort{{ContainerPort: constants.ContainerTrainerPort}}).
+		Env(constants.Node, constants.Node,
+			[]corev1.EnvVar{
+				{
+					Name:  constants.TorchEnvNumNodes,
+					Value: "1",
+				},
+				{
+					Name:  constants.TorchEnvNumProcPerNode,
+					Value: numProcPerNode,
+				},
+				{
+					Name: constants.TorchEnvNodeRank,
+					ValueFrom: &corev1.EnvVarSource{
+						FieldRef: &corev1.ObjectFieldSelector{
+							FieldPath: constants.JobCompletionIndexFieldPath,
+						},
+					},
+				},
+				{
+					Name:  constants.TorchEnvMasterAddr,
+					Value: fmt.Sprintf("test-job-%s-0-0.test-job", constants.Node),
+				},
+				{
+					Name:  constants.TorchEnvMasterPort,
+					Value: fmt.Sprintf("%d", constants.ContainerTrainerPort),
+				},
+			}...,
+		)
+}
+
 func TestTrainingRuntimeNewObjects(t *testing.T) {
+	// Do not use t.Parallel() — SetFeatureGateDuringTest mutates global state.
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.TrainJobDynamicResourceAllocation, true)
 	resRequests := corev1.ResourceList{
 		corev1.ResourceCPU: resource.MustParse("1"),
 	}
@@ -111,6 +218,56 @@ func TestTrainingRuntimeNewObjects(t *testing.T) {
 					MinResources(corev1.ResourceList{
 						// Trainer node has 30 CPUs + 2 CPUs from 2 initializer containers.
 						corev1.ResourceCPU: resource.MustParse("32"),
+					}).
+					SchedulingTimeout(120).
+					Obj(),
+			},
+		},
+		"succeeded to build PodGroup and JobSet with multi-slice TPU trainer.": {
+			trainingRuntime: testingutil.MakeTrainingRuntimeWrapper(metav1.NamespaceDefault, "test-runtime").
+				RuntimeSpec(
+					testingutil.MakeTrainingRuntimeSpecWrapper(testingutil.MakeTrainingRuntimeWrapper(metav1.NamespaceDefault, "test-runtime").Spec).
+						WithMLPolicy(
+							testingutil.MakeMLPolicyWrapper().
+								WithNumNodes(32).
+								Obj(),
+						).
+						PodGroupPolicyCoschedulingSchedulingTimeout(120).
+						Replicas(4, constants.Node).
+						Container(constants.DatasetInitializer, constants.DatasetInitializer, "test:runtime", []string{"runtime"}, []string{"runtime"}, resRequests).
+						Container(constants.ModelInitializer, constants.ModelInitializer, "test:runtime", []string{"runtime"}, []string{"runtime"}, resRequests).
+						Container(constants.Node, constants.Node, "test:runtime", []string{"runtime"}, []string{"runtime"}, resRequests).
+						Obj(),
+				).Obj(),
+			trainJob: testingutil.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
+				UID("uid").
+				RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.TrainingRuntimeKind), "test-runtime").
+				Trainer(
+					testingutil.MakeTrainJobTrainerWrapper().
+						NumNodes(32).
+						Obj(),
+				).
+				Obj(),
+			wantObjs: []runtime.Object{
+				testingutil.MakeJobSetWrapper(metav1.NamespaceDefault, "test-job").
+					ControllerReference(trainer.SchemeGroupVersion.WithKind(trainer.TrainJobKind), "test-job", "uid").
+					Replicas(4, constants.Node).
+					Replicas(1, constants.DatasetInitializer, constants.ModelInitializer, constants.Launcher).
+					Parallelism(8, constants.Node).
+					Parallelism(1, constants.DatasetInitializer, constants.ModelInitializer, constants.Launcher).
+					Completions(8, constants.Node).
+					Completions(1, constants.DatasetInitializer, constants.ModelInitializer, constants.Launcher).
+					NumNodes(8).
+					Container(constants.DatasetInitializer, constants.DatasetInitializer, "test:runtime", []string{"runtime"}, []string{"runtime"}, resRequests).
+					Container(constants.ModelInitializer, constants.ModelInitializer, "test:runtime", []string{"runtime"}, []string{"runtime"}, resRequests).
+					Container(constants.Node, constants.Node, "test:runtime", []string{"runtime"}, []string{"runtime"}, resRequests).
+					PodLabel(schedulerpluginsv1alpha1.PodGroupLabel, "test-job").
+					Obj(),
+				testingutil.MakeSchedulerPluginsPodGroup(metav1.NamespaceDefault, "test-job").
+					ControllerReference(trainer.SchemeGroupVersion.WithKind(trainer.TrainJobKind), "test-job", "uid").
+					MinMember(34). // 34 = 8 nodes × 4 slices + 1 DatasetInitializer + 1 ModelInitializer
+					MinResources(corev1.ResourceList{
+						corev1.ResourceCPU: resource.MustParse("34"),
 					}).
 					SchedulingTimeout(120).
 					Obj(),
@@ -195,6 +352,7 @@ func TestTrainingRuntimeNewObjects(t *testing.T) {
 							WithNumNodes(100).
 							Obj(),
 					).
+					SchedulerName(constants.DatasetInitializer, "default-scheduler").
 					InitContainer(constants.DatasetInitializer, "override-init-container", "test:runtime",
 						[]corev1.EnvVar{
 							{
@@ -358,6 +516,7 @@ func TestTrainingRuntimeNewObjects(t *testing.T) {
 												Spec: &trainer.JobSpecPatch{
 													Template: &trainer.PodTemplatePatch{
 														Spec: &trainer.PodSpecPatch{
+															SchedulerName:      "volcano",
 															ServiceAccountName: ptr.To("override-sa"),
 															InitContainers: []trainer.ContainerPatch{
 																{
@@ -429,6 +588,7 @@ func TestTrainingRuntimeNewObjects(t *testing.T) {
 																	Effect:   corev1.TaintEffectNoSchedule,
 																},
 															},
+															TerminationGracePeriodSeconds: ptr.To(int64(300)),
 															Volumes: []corev1.Volume{
 																{
 																	Name: "node_secret",
@@ -462,6 +622,8 @@ func TestTrainingRuntimeNewObjects(t *testing.T) {
 			wantObjs: []runtime.Object{
 				testingutil.MakeJobSetWrapper(metav1.NamespaceDefault, "test-job").
 					ControllerReference(trainer.SchemeGroupVersion.WithKind(trainer.TrainJobKind), "test-job", "uid").
+					SchedulerName(constants.DatasetInitializer, "default-scheduler").
+					SchedulerName(constants.Node, "volcano").
 					ServiceAccountName(constants.Node, "override-sa").
 					Replicas(1, constants.DatasetInitializer, constants.ModelInitializer, constants.Node).
 					Parallelism(1, constants.DatasetInitializer, constants.ModelInitializer).
@@ -574,6 +736,7 @@ func TestTrainingRuntimeNewObjects(t *testing.T) {
 							Operator: corev1.TolerationOpExists,
 							Effect:   corev1.TaintEffectNoSchedule,
 						}).
+					TerminationGracePeriodSeconds(constants.Node, 300).
 					Volumes(constants.DatasetInitializer,
 						corev1.Volume{
 							Name: "initializer_claim",
@@ -1357,6 +1520,65 @@ func TestTrainingRuntimeNewObjects(t *testing.T) {
 					Obj(),
 			},
 		},
+		"succeeded to build JobSet with Torch values from the Runtime when the TrainJob omits spec.trainer.": {
+			trainingRuntime: testingutil.MakeTrainingRuntimeWrapper(metav1.NamespaceDefault, "test-runtime").RuntimeSpec(
+				testingutil.MakeTrainingRuntimeSpecWrapper(testingutil.MakeTrainingRuntimeWrapper(metav1.NamespaceDefault, "test-runtime").Spec).
+					WithMLPolicy(
+						testingutil.MakeMLPolicyWrapper().
+							WithNumNodes(2).
+							WithMLPolicySource(*testingutil.MakeMLPolicySourceWrapper().
+								TorchPolicy().
+								Obj(),
+							).
+							Obj(),
+					).
+					Container(constants.Node, constants.Node, "test:runtime", []string{"runtime"}, []string{"runtime"}, resRequests).
+					Obj(),
+			).Obj(),
+			trainJob: testingutil.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
+				UID("uid").
+				RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.TrainingRuntimeKind), "test-runtime").
+				Obj(),
+			wantObjs: []runtime.Object{
+				testingutil.MakeJobSetWrapper(metav1.NamespaceDefault, "test-job").
+					ControllerReference(trainer.SchemeGroupVersion.WithKind(trainer.TrainJobKind), "test-job", "uid").
+					Replicas(1, constants.DatasetInitializer, constants.ModelInitializer, constants.Node, constants.Launcher).
+					Parallelism(1, constants.DatasetInitializer, constants.ModelInitializer).
+					Completions(1, constants.DatasetInitializer, constants.ModelInitializer).
+					NumNodes(2).
+					Container(constants.Node, constants.Node, "test:runtime", []string{"runtime"}, []string{"runtime"}, resRequests).
+					ContainerTrainerPorts([]corev1.ContainerPort{{ContainerPort: constants.ContainerTrainerPort}}).
+					Env(constants.Node, constants.Node,
+						[]corev1.EnvVar{
+							{
+								Name:  constants.TorchEnvNumNodes,
+								Value: "2",
+							},
+							{
+								Name:  constants.TorchEnvNumProcPerNode,
+								Value: "1",
+							},
+							{
+								Name: constants.TorchEnvNodeRank,
+								ValueFrom: &corev1.EnvVarSource{
+									FieldRef: &corev1.ObjectFieldSelector{
+										FieldPath: constants.JobCompletionIndexFieldPath,
+									},
+								},
+							},
+							{
+								Name:  constants.TorchEnvMasterAddr,
+								Value: fmt.Sprintf("test-job-%s-0-0.test-job", constants.Node),
+							},
+							{
+								Name:  constants.TorchEnvMasterPort,
+								Value: fmt.Sprintf("%d", constants.ContainerTrainerPort),
+							},
+						}...,
+					).
+					Obj(),
+			},
+		},
 		"succeeded to build JobSet with TorchTune values from the TrainJob": {
 			trainingRuntime: testingutil.MakeTrainingRuntimeWrapper(metav1.NamespaceDefault, "torchtune-llama3.3-70b").RuntimeSpec(
 				testingutil.MakeTrainingRuntimeSpecWrapper(testingutil.MakeTrainingRuntimeWrapper(metav1.NamespaceDefault, "torchtune-llama3.3-70b").Spec).
@@ -1558,7 +1780,7 @@ func TestTrainingRuntimeNewObjects(t *testing.T) {
 								"dataset=torchtune.datasets.instruct_dataset",
 								"dataset.source=parquet",
 							},
-							corev1.ResourceList{"example.com/gpu": resource.MustParse("2")},
+							torchTuneResWithCPU("2"),
 						).
 						NumNodes(1).
 						Obj(),
@@ -1593,7 +1815,7 @@ func TestTrainingRuntimeNewObjects(t *testing.T) {
 							"dataset=torchtune.datasets.instruct_dataset",
 							"dataset.source=parquet",
 						},
-						corev1.ResourceList{"example.com/gpu": resource.MustParse("2")},
+						torchTuneResWithCPU("2"),
 					).
 					ContainerTrainerPorts([]corev1.ContainerPort{{ContainerPort: constants.ContainerTrainerPort}}).
 					Env(constants.Node, constants.Node,
@@ -1699,7 +1921,7 @@ func TestTrainingRuntimeNewObjects(t *testing.T) {
 								"dataset=torchtune.datasets.instruct_dataset",
 								"dataset.source=parquet",
 							},
-							corev1.ResourceList{"example.com/gpu": resource.MustParse("1")},
+							torchTuneResWithCPU("1"),
 						).
 						NumNodes(1).
 						Obj(),
@@ -1734,7 +1956,7 @@ func TestTrainingRuntimeNewObjects(t *testing.T) {
 							"dataset=torchtune.datasets.instruct_dataset",
 							"dataset.source=parquet",
 						},
-						corev1.ResourceList{"example.com/gpu": resource.MustParse("1")},
+						torchTuneResWithCPU("1"),
 					).
 					ContainerTrainerPorts([]corev1.ContainerPort{{ContainerPort: constants.ContainerTrainerPort}}).
 					Env(constants.Node, constants.Node,
@@ -1841,7 +2063,7 @@ func TestTrainingRuntimeNewObjects(t *testing.T) {
 								"dataset=torchtune.datasets.instruct_dataset",
 								"dataset.source=parquet",
 							},
-							corev1.ResourceList{"example.com/gpu": resource.MustParse("2")},
+							torchTuneResWithCPU("2"),
 						).
 						NumNodes(1).
 						Obj(),
@@ -1878,7 +2100,7 @@ func TestTrainingRuntimeNewObjects(t *testing.T) {
 							"dataset=torchtune.datasets.instruct_dataset",
 							"dataset.source=parquet",
 						},
-						corev1.ResourceList{"example.com/gpu": resource.MustParse("2")},
+						torchTuneResWithCPU("2"),
 					).
 					ContainerTrainerPorts([]corev1.ContainerPort{{ContainerPort: constants.ContainerTrainerPort}}).
 					Env(constants.Node, constants.Node,
@@ -1978,19 +2200,23 @@ test-job-node-0-1.test-job slots=8
 							Name: constants.MPISSHAuthVolumeName,
 							VolumeSource: corev1.VolumeSource{
 								Secret: &corev1.SecretVolumeSource{
-									SecretName: fmt.Sprintf("test-job%s", constants.MPISSHAuthSecretSuffix),
+									SecretName:  fmt.Sprintf("test-job%s", constants.MPISSHAuthSecretSuffix),
+									DefaultMode: ptr.To(constants.MPISSHAuthDefaultMode),
 									Items: []corev1.KeyToPath{
 										{
 											Key:  corev1.SSHAuthPrivateKey,
 											Path: constants.MPISSHPrivateKeyFile,
+											Mode: ptr.To(constants.MPISSHPrivateKeyFileMode),
 										},
 										{
 											Key:  constants.MPISSHPublicKey,
 											Path: constants.MPISSHPublicKeyFile,
+											Mode: ptr.To(constants.MPISSHPublicKeyFileMode),
 										},
 										{
 											Key:  constants.MPISSHPublicKey,
 											Path: constants.MPISSHAuthorizedKeys,
+											Mode: ptr.To(constants.MPISSHPublicKeyFileMode),
 										},
 									},
 								},
@@ -2017,19 +2243,23 @@ test-job-node-0-1.test-job slots=8
 							Name: constants.MPISSHAuthVolumeName,
 							VolumeSource: corev1.VolumeSource{
 								Secret: &corev1.SecretVolumeSource{
-									SecretName: fmt.Sprintf("test-job%s", constants.MPISSHAuthSecretSuffix),
+									SecretName:  fmt.Sprintf("test-job%s", constants.MPISSHAuthSecretSuffix),
+									DefaultMode: ptr.To(constants.MPISSHAuthDefaultMode),
 									Items: []corev1.KeyToPath{
 										{
 											Key:  corev1.SSHAuthPrivateKey,
 											Path: constants.MPISSHPrivateKeyFile,
+											Mode: ptr.To(constants.MPISSHPrivateKeyFileMode),
 										},
 										{
 											Key:  constants.MPISSHPublicKey,
 											Path: constants.MPISSHPublicKeyFile,
+											Mode: ptr.To(constants.MPISSHPublicKeyFileMode),
 										},
 										{
 											Key:  constants.MPISSHPublicKey,
 											Path: constants.MPISSHAuthorizedKeys,
+											Mode: ptr.To(constants.MPISSHPublicKeyFileMode),
 										},
 									},
 								},
@@ -2060,8 +2290,216 @@ test-job-node-0-1.test-job slots=8
 							Name:  constants.OpenMPIEnvKeyRSHArgs,
 							Value: constants.OpenMPIEnvDefaultValueRSHArgs,
 						},
+						corev1.EnvVar{
+							Name:  constants.PRTEEnvHostFileLocation,
+							Value: fmt.Sprintf("%s/%s", constants.MPIHostfileDir, constants.MPIHostfileName),
+						},
+						corev1.EnvVar{
+							Name:  constants.PRTEEnvKeepFQDNHostNames,
+							Value: "false",
+						},
+						corev1.EnvVar{
+							Name:  constants.PRTEEnvDefaultSlots,
+							Value: "8",
+						},
+						corev1.EnvVar{
+							Name:  constants.PRTEEnvKeySSHArgs,
+							Value: constants.OpenMPIEnvDefaultValueRSHArgs,
+						},
 					).
 					Container(constants.Node, constants.Node, "test:runtime", []string{"runtime"}, []string{"runtime"}, resRequests).
+					Obj(),
+			},
+		},
+		"merged resourcesPerNode keeps runtime resources when trainjob sets gpu only": {
+			trainingRuntime: testingutil.MakeTrainingRuntimeWrapper(metav1.NamespaceDefault, "test-runtime").RuntimeSpec(
+				testingutil.MakeTrainingRuntimeSpecWrapper(testingutil.MakeTrainingRuntimeWrapper(metav1.NamespaceDefault, "test-runtime").Spec).
+					WithMLPolicy(
+						testingutil.MakeMLPolicyWrapper().
+							WithNumNodes(1).
+							Obj(),
+					).
+					Container(constants.Node, constants.Node, "test:runtime", []string{"runtime"}, []string{"runtime"}, resRequests).
+					Obj(),
+			).Obj(),
+			trainJob: func() *trainer.TrainJob {
+				trainerSpec := testingutil.MakeTrainJobTrainerWrapper().
+					NumNodes(1).
+					Obj()
+				trainerSpec.ResourcesPerNode = &corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"nvidia.com/gpu": resource.MustParse("4"),
+					},
+				}
+				return testingutil.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
+					UID("uid").
+					RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.TrainingRuntimeKind), "test-runtime").
+					Trainer(trainerSpec).
+					Obj()
+			}(),
+			wantObjs: []runtime.Object{
+				wantJobSetWithMergedGPU(metav1.NamespaceDefault, "test-job", "uid", resRequests, "4"),
+			},
+		},
+		// Test cases for the DRA resourceClaimsPerNode.
+		"resourceClaimsPerNode is added to the Pod resourceClaims and the node container claims": {
+			trainingRuntime: testingutil.MakeTrainingRuntimeWrapper(metav1.NamespaceDefault, "test-runtime").RuntimeSpec(
+				draTorchRuntimeSpec(resRequests).Obj(),
+			).Obj(),
+			trainJob: testingutil.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
+				UID("uid").
+				RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.TrainingRuntimeKind), "test-runtime").
+				Trainer(
+					testingutil.MakeTrainJobTrainerWrapper().
+						ResourceClaimsPerNode(trainer.TrainerResourceClaim{Name: "gpu", ResourceClaimTemplateName: "tmpl"}).
+						Obj(),
+				).
+				Obj(),
+			wantObjs: []runtime.Object{
+				wantDRATorchJobSet(resRequests, "1").
+					PodResourceClaims(constants.Node, corev1.PodResourceClaim{Name: "gpu", ResourceClaimTemplateName: ptr.To("tmpl")}).
+					ContainerResourceClaims(constants.Node, constants.Node, corev1.ResourceClaim{Name: "gpu"}).
+					Obj(),
+			},
+		},
+		"runtime claim with the same name is replaced by resourceClaimsPerNode": {
+			trainingRuntime: testingutil.MakeTrainingRuntimeWrapper(metav1.NamespaceDefault, "test-runtime").RuntimeSpec(
+				draTorchRuntimeSpec(resRequests).
+					PodResourceClaims(constants.Node, corev1.PodResourceClaim{Name: "gpu", ResourceClaimTemplateName: ptr.To("tmpl-a")}).
+					ContainerResourceClaims(constants.Node, constants.Node, corev1.ResourceClaim{Name: "gpu"}).
+					Obj(),
+			).Obj(),
+			trainJob: testingutil.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
+				UID("uid").
+				RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.TrainingRuntimeKind), "test-runtime").
+				Trainer(
+					testingutil.MakeTrainJobTrainerWrapper().
+						ResourceClaimsPerNode(trainer.TrainerResourceClaim{Name: "gpu", ResourceClaimTemplateName: "tmpl-b"}).
+						Obj(),
+				).
+				Obj(),
+			// Only tmpl-b is seeded, so PET_NPROC_PER_NODE=auto proves the TrainJob's template was resolved.
+			wantObjs: []runtime.Object{
+				wantDRATorchJobSet(resRequests, "1").
+					PodResourceClaims(constants.Node, corev1.PodResourceClaim{Name: "gpu", ResourceClaimTemplateName: ptr.To("tmpl-b")}).
+					ContainerResourceClaims(constants.Node, constants.Node, corev1.ResourceClaim{Name: "gpu"}).
+					Obj(),
+			},
+		},
+		"resourcesPerNode keeps the runtime's DRA claims": {
+			trainingRuntime: testingutil.MakeTrainingRuntimeWrapper(metav1.NamespaceDefault, "test-runtime").RuntimeSpec(
+				draTorchRuntimeSpec(resRequests).
+					PodResourceClaims(constants.Node, corev1.PodResourceClaim{Name: "gpu", ResourceClaimTemplateName: ptr.To("tmpl")}).
+					ContainerResourceClaims(constants.Node, constants.Node, corev1.ResourceClaim{Name: "gpu"}).
+					Obj(),
+			).Obj(),
+			trainJob: testingutil.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
+				UID("uid").
+				RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.TrainingRuntimeKind), "test-runtime").
+				Trainer(
+					testingutil.MakeTrainJobTrainerWrapper().
+						Container("test:trainjob", []string{"trainjob"}, []string{"trainjob"}, resRequests).
+						Obj(),
+				).
+				Obj(),
+			wantObjs: []runtime.Object{
+				wantDRATorchJobSet(resRequests, "1").
+					Container(constants.Node, constants.Node, "test:trainjob", []string{"trainjob"}, []string{"trainjob"}, resRequests).
+					PodResourceClaims(constants.Node, corev1.PodResourceClaim{Name: "gpu", ResourceClaimTemplateName: ptr.To("tmpl")}).
+					ContainerResourceClaims(constants.Node, constants.Node, corev1.ResourceClaim{Name: "gpu"}).
+					Obj(),
+			},
+		},
+		"resourceClaimsPerNode drops the request of a runtime container claim with the same name": {
+			trainingRuntime: testingutil.MakeTrainingRuntimeWrapper(metav1.NamespaceDefault, "test-runtime").RuntimeSpec(
+				draTorchRuntimeSpec(resRequests).
+					PodResourceClaims(constants.Node,
+						corev1.PodResourceClaim{Name: "nic", ResourceClaimTemplateName: ptr.To("nic-tmpl")},
+						corev1.PodResourceClaim{Name: "gpu", ResourceClaimTemplateName: ptr.To("tmpl-a")},
+					).
+					ContainerResourceClaims(constants.Node, constants.Node,
+						corev1.ResourceClaim{Name: "nic"},
+						corev1.ResourceClaim{Name: "gpu", Request: "gpu-0"},
+					).
+					Obj(),
+			).Obj(),
+			trainJob: testingutil.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
+				UID("uid").
+				RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.TrainingRuntimeKind), "test-runtime").
+				Trainer(
+					testingutil.MakeTrainJobTrainerWrapper().
+						ResourceClaimsPerNode(trainer.TrainerResourceClaim{Name: "gpu", ResourceClaimTemplateName: "tmpl"}).
+						Obj(),
+				).
+				Obj(),
+			// resourceClaimsPerNode replaces the Pod-level claim, so the runtime's container-level
+			// request, which named a device request in the previous template, is dropped with it.
+			wantObjs: []runtime.Object{
+				wantDRATorchJobSet(resRequests, "1").
+					PodResourceClaims(constants.Node,
+						corev1.PodResourceClaim{Name: "nic", ResourceClaimTemplateName: ptr.To("nic-tmpl")},
+						corev1.PodResourceClaim{Name: "gpu", ResourceClaimTemplateName: ptr.To("tmpl")},
+					).
+					ContainerResourceClaims(constants.Node, constants.Node,
+						corev1.ResourceClaim{Name: "gpu"},
+						corev1.ResourceClaim{Name: "nic"},
+					).
+					Obj(),
+			},
+		},
+		"runtimePatches wire a claim into an init container while resourceClaimsPerNode wires the node container": {
+			trainingRuntime: testingutil.MakeTrainingRuntimeWrapper(metav1.NamespaceDefault, "test-runtime").RuntimeSpec(
+				draTorchRuntimeSpec(resRequests).
+					InitContainer(constants.Node, constants.ModelInitializer, "test:runtime").
+					Obj(),
+			).Obj(),
+			trainJob: testingutil.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
+				UID("uid").
+				RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.TrainingRuntimeKind), "test-runtime").
+				Trainer(
+					testingutil.MakeTrainJobTrainerWrapper().
+						ResourceClaimsPerNode(trainer.TrainerResourceClaim{Name: "gpu", ResourceClaimTemplateName: "tmpl"}).
+						Obj(),
+				).
+				RuntimePatches([]trainer.RuntimePatch{
+					{
+						Manager: "manager-1",
+						TrainingRuntimeSpec: &trainer.TrainingRuntimeSpecPatch{
+							Template: &trainer.JobSetTemplatePatch{
+								Spec: &trainer.JobSetSpecPatch{
+									ReplicatedJobs: []trainer.ReplicatedJobPatch{
+										{
+											Name: constants.Node,
+											Template: &trainer.JobTemplatePatch{
+												Spec: &trainer.JobSpecPatch{
+													Template: &trainer.PodTemplatePatch{
+														Spec: &trainer.PodSpecPatch{
+															InitContainers: []trainer.ContainerPatch{
+																{
+																	Name: constants.ModelInitializer,
+																	Resources: &corev1.ResourceRequirements{
+																		Claims: []corev1.ResourceClaim{{Name: "gpu"}},
+																	},
+																},
+															},
+														},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				}).
+				Obj(),
+			wantObjs: []runtime.Object{
+				wantDRATorchJobSet(resRequests, "1").
+					InitContainer(constants.Node, constants.ModelInitializer, "test:runtime").
+					ContainerResourceClaims(constants.Node, constants.ModelInitializer, corev1.ResourceClaim{Name: "gpu"}).
+					PodResourceClaims(constants.Node, corev1.PodResourceClaim{Name: "gpu", ResourceClaimTemplateName: ptr.To("tmpl")}).
+					ContainerResourceClaims(constants.Node, constants.Node, corev1.ResourceClaim{Name: "gpu"}).
 					Obj(),
 			},
 		},
@@ -2124,6 +2562,757 @@ test-job-node-0-1.test-job slots=8
 
 			if diff := cmp.Diff(tc.wantObjs, resultObjs, append(cmpOpts, tc.ObjCmpOpts...)...); len(diff) != 0 {
 				t.Errorf("Unexpected objects (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestRuntimeInfo(t *testing.T) {
+	tests := map[string]struct {
+		templateType string
+	}{
+		"invalid template type returns error": {
+			templateType: "invalid-template-type",
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			// Using zero-value TrainingRuntime is safe here because RuntimeInfo
+			// returns early for unsupported template types before accessing internal fields.
+			rt := &TrainingRuntime{}
+
+			trainJob := &trainer.TrainJob{}
+
+			_, err := rt.RuntimeInfo(
+				trainJob,
+				tt.templateType,
+				nil,
+				nil,
+				nil,
+			)
+
+			if err == nil {
+				t.Fatalf("expected error for unsupported runtimeTemplateSpec, got nil")
+			}
+
+			if !strings.Contains(err.Error(), "unsupported runtimeTemplateSpec") {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestTrainingRuntimeDeleteObjects(t *testing.T) {
+	errGetPodGroup := errors.New("failed to get the PodGroup")
+
+	failedTrainJob := func(name string) *trainer.TrainJob {
+		return testingutil.MakeTrainJobWrapper(metav1.NamespaceDefault, name).
+			UID("uid").
+			RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.TrainingRuntimeKind), "test-runtime").
+			Conditions(metav1.Condition{Type: trainer.TrainJobFailed, Status: metav1.ConditionTrue}).
+			Obj()
+	}
+	runningTrainJob := func(name string) *trainer.TrainJob {
+		return testingutil.MakeTrainJobWrapper(metav1.NamespaceDefault, name).
+			UID("uid").
+			RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.TrainingRuntimeKind), "test-runtime").
+			Obj()
+	}
+	ownedPodGroup := func(name string) *volcanov1beta1.PodGroup {
+		// No TypeMeta: Delete() returns whatever the fake client's Get() populates,
+		// which (like a real client) leaves TypeMeta unset on a typed object.
+		pg := testingutil.MakeVolcanoPodGroup(metav1.NamespaceDefault, name).
+			ControllerReference(trainer.SchemeGroupVersion.WithKind(trainer.TrainJobKind), name, "uid").
+			Obj()
+		pg.TypeMeta = metav1.TypeMeta{}
+		return pg
+	}
+
+	cases := map[string]struct {
+		trainJob       *trainer.TrainJob
+		podGroup       *volcanov1beta1.PodGroup
+		podGroupGetErr error
+		wantObjs       []client.Object
+		wantErr        error
+	}{
+		"failed TrainJob returns its PodGroup, without the runtime existing": {
+			trainJob: failedTrainJob("test-job"),
+			podGroup: ownedPodGroup("test-job"),
+			wantObjs: []client.Object{ownedPodGroup("test-job")},
+		},
+		"running TrainJob returns nothing": {
+			trainJob: runningTrainJob("test-job"),
+			podGroup: ownedPodGroup("test-job"),
+			wantObjs: nil,
+		},
+		"failed TrainJob without a PodGroup returns nothing": {
+			trainJob: failedTrainJob("test-job"),
+			wantObjs: nil,
+		},
+		"failed read of the PodGroup is returned so the reconcile is retried": {
+			trainJob:       failedTrainJob("test-job"),
+			podGroup:       ownedPodGroup("test-job"),
+			podGroupGetErr: errGetPodGroup,
+			wantErr:        errGetPodGroup,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			t.Cleanup(cancel)
+
+			// The runtime is deliberately not created: DeleteObjects must not need it.
+			clientBuilder := testingutil.WithVolcanoPodGroupRESTMapping(testingutil.NewClientBuilder())
+			if tc.podGroup != nil {
+				clientBuilder.WithObjects(tc.podGroup)
+			}
+			if tc.podGroupGetErr != nil {
+				clientBuilder.WithInterceptorFuncs(interceptor.Funcs{
+					Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+						if _, ok := obj.(*volcanov1beta1.PodGroup); ok {
+							return tc.podGroupGetErr
+						}
+						return c.Get(ctx, key, obj, opts...)
+					},
+				})
+			}
+			c := clientBuilder.Build()
+
+			rt, err := NewTrainingRuntime(ctx, c, testingutil.AsIndex(clientBuilder), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gotObjs, err := rt.DeleteObjects(ctx, tc.trainJob)
+			if diff := cmp.Diff(tc.wantErr, err, cmpopts.EquateErrors()); len(diff) != 0 {
+				t.Errorf("Unexpected error (-want,+got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tc.wantObjs, gotObjs, cmpopts.IgnoreFields(metav1.ObjectMeta{}, "ResourceVersion")); len(diff) != 0 {
+				t.Errorf("Unexpected objects (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestNewRuntimeInfoScheduling(t *testing.T) {
+	scheduling := &trainer.TrainingRuntimeScheduling{
+		ReplicatedJobs: []trainer.ReplicatedJobScheduling{{TargetReplicatedJobs: []string{constants.Node}}},
+	}
+	trainingRuntime := testingutil.MakeTrainingRuntimeWrapper(metav1.NamespaceDefault, "test-runtime").Obj()
+	trainJob := testingutil.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").Obj()
+
+	info, err := (&TrainingRuntime{}).newRuntimeInfo(trainJob, trainingRuntime.Spec.Template, nil, nil, scheduling.DeepCopy())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if diff := cmp.Diff(scheduling, info.RuntimePolicy.Scheduling); len(diff) != 0 {
+		t.Errorf("Unexpected RuntimePolicy.Scheduling (-want,+got):\n%s", diff)
+	}
+}
+
+func TestTrainingRuntimeValidateObjects(t *testing.T) {
+	// Do not use t.Parallel() — SetFeatureGateDuringTest mutates global state.
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.TrainJobWorkloadAwareScheduling, true)
+	validRuntime := testingutil.MakeTrainingRuntimeWrapper(metav1.NamespaceDefault, "test-runtime").Obj()
+
+	cases := map[string]struct {
+		trainJob        *trainer.TrainJob
+		existingRuntime *trainer.TrainingRuntime
+		wantErrs        field.ErrorList
+	}{
+		"succeeds when runtime exists and is valid": {
+			trainJob: testingutil.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
+				RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.TrainingRuntimeKind), "test-runtime").
+				Obj(),
+			existingRuntime: validRuntime,
+			wantErrs:        nil,
+		},
+		"returns field error when runtime does not exist": {
+			trainJob: testingutil.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
+				RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.TrainingRuntimeKind), "nonexistent-runtime").
+				Obj(),
+			existingRuntime: nil,
+			wantErrs: field.ErrorList{
+				field.Invalid(field.NewPath("spec", "runtimeRef"), trainer.RuntimeRef{
+					Name:     "nonexistent-runtime",
+					APIGroup: ptr.To(trainer.GroupVersion.Group),
+					Kind:     ptr.To(trainer.TrainingRuntimeKind),
+				}, ""),
+			},
+		},
+		"patch[0] adds volume and patch[1] mounts it - real merge validates successfully": {
+			trainJob: testingutil.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
+				RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.TrainingRuntimeKind), "test-runtime").
+				RuntimePatches([]trainer.RuntimePatch{
+					{
+						Manager: "test.io/volume-manager",
+						TrainingRuntimeSpec: &trainer.TrainingRuntimeSpecPatch{
+							Template: &trainer.JobSetTemplatePatch{
+								Spec: &trainer.JobSetSpecPatch{
+									ReplicatedJobs: []trainer.ReplicatedJobPatch{{
+										Name: "node",
+										Template: &trainer.JobTemplatePatch{
+											Spec: &trainer.JobSpecPatch{
+												Template: &trainer.PodTemplatePatch{
+													Spec: &trainer.PodSpecPatch{
+														Volumes: []corev1.Volume{{
+															Name: "shared-data",
+															VolumeSource: corev1.VolumeSource{
+																EmptyDir: &corev1.EmptyDirVolumeSource{},
+															},
+														}},
+													},
+												},
+											},
+										},
+									}},
+								},
+							},
+						},
+					},
+					{
+						Manager: "test.io/mount-manager",
+						TrainingRuntimeSpec: &trainer.TrainingRuntimeSpecPatch{
+							Template: &trainer.JobSetTemplatePatch{
+								Spec: &trainer.JobSetSpecPatch{
+									ReplicatedJobs: []trainer.ReplicatedJobPatch{{
+										Name: "node",
+										Template: &trainer.JobTemplatePatch{
+											Spec: &trainer.JobSpecPatch{
+												Template: &trainer.PodTemplatePatch{
+													Spec: &trainer.PodSpecPatch{
+														Containers: []trainer.ContainerPatch{{
+															Name: "node",
+															VolumeMounts: []corev1.VolumeMount{
+																{Name: "shared-data", MountPath: "/data"},
+															},
+														}},
+													},
+												},
+											},
+										},
+									}},
+								},
+							},
+						},
+					},
+				}).
+				Obj(),
+			existingRuntime: validRuntime,
+			wantErrs:        nil,
+		},
+		"returns field error when TrainJob sets resourceClaimsPerNode and runtime sets Job-level resourceClaims": {
+			trainJob: testingutil.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
+				RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.TrainingRuntimeKind), "test-runtime").
+				Trainer(testingutil.MakeTrainJobTrainerWrapper().
+					ResourceClaimsPerNode(trainer.TrainerResourceClaim{Name: "gpu", ResourceClaimTemplateName: "gpu-template"}).
+					Obj()).
+				Obj(),
+			existingRuntime: testingutil.MakeTrainingRuntimeWrapper(metav1.NamespaceDefault, "test-runtime").
+				RuntimeSpec(testingutil.MakeTrainingRuntimeSpecWrapper(testingutil.MakeTrainingRuntimeWrapper(metav1.NamespaceDefault, "test-runtime").Obj().Spec).
+					Scheduling(&trainer.TrainingRuntimeScheduling{
+						ReplicatedJobs: []trainer.ReplicatedJobScheduling{
+							{TargetReplicatedJobs: []string{constants.DatasetInitializer, constants.ModelInitializer}},
+							{
+								TargetReplicatedJobs: []string{constants.Node},
+								Job: &trainer.JobScheduling{
+									ResourceClaims: []schedulingv1alpha3.WorkloadPodGroupResourceClaim{{
+										Name:                      "tpu-slice",
+										ResourceClaimTemplateName: ptr.To("tpu-slice-template"),
+									}},
+								},
+							},
+						},
+					}).
+					Obj()).
+				Obj(),
+			wantErrs: field.ErrorList{
+				field.Forbidden(field.NewPath("spec", "trainer", "resourceClaimsPerNode"), ""),
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+
+			clientBuilder := testingutil.WithWorkloadRESTMapping(testingutil.NewClientBuilder())
+			if tc.existingRuntime != nil {
+				clientBuilder = clientBuilder.WithObjects(tc.existingRuntime)
+			}
+			c := clientBuilder.Build()
+
+			trainingRuntime, err := NewTrainingRuntime(ctx, c, testingutil.AsIndex(clientBuilder), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, fieldErrors := trainingRuntime.ValidateObjects(ctx, nil, tc.trainJob)
+
+			if diff := cmp.Diff(tc.wantErrs, fieldErrors, cmpopts.IgnoreFields(field.Error{}, "Detail")); diff != "" {
+				t.Errorf("Unexpected field errors (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestApplyTrainerPodResourceClaims(t *testing.T) {
+	cases := map[string]struct {
+		podSpec *corev1ac.PodSpecApplyConfiguration
+		claims  []trainer.TrainerResourceClaim
+		want    []corev1ac.PodResourceClaimApplyConfiguration
+		// disableDRAGate turns the TrainJobDynamicResourceAllocation feature gate off for the case.
+		disableDRAGate bool
+	}{
+		"feature gate disabled leaves the pod resourceClaims untouched": {
+			podSpec: corev1ac.PodSpec().WithResourceClaims(
+				corev1ac.PodResourceClaim().WithName("nic").WithResourceClaimTemplateName("nic-tmpl"),
+			),
+			claims: []trainer.TrainerResourceClaim{{Name: "gpu", ResourceClaimTemplateName: "tmpl"}},
+			want: []corev1ac.PodResourceClaimApplyConfiguration{
+				*corev1ac.PodResourceClaim().WithName("nic").WithResourceClaimTemplateName("nic-tmpl"),
+			},
+			disableDRAGate: true,
+		},
+		"no claims leaves the pod resourceClaims untouched": {
+			podSpec: corev1ac.PodSpec().WithResourceClaims(
+				corev1ac.PodResourceClaim().WithName("nic").WithResourceClaimTemplateName("nic-tmpl"),
+			),
+			want: []corev1ac.PodResourceClaimApplyConfiguration{
+				*corev1ac.PodResourceClaim().WithName("nic").WithResourceClaimTemplateName("nic-tmpl"),
+			},
+		},
+		"new claims are appended in declaration order": {
+			podSpec: corev1ac.PodSpec().WithResourceClaims(
+				corev1ac.PodResourceClaim().WithName("nic").WithResourceClaimTemplateName("nic-tmpl"),
+			),
+			claims: []trainer.TrainerResourceClaim{
+				{Name: "gpu", ResourceClaimTemplateName: "gpu-tmpl"},
+				{Name: "fpga", ResourceClaimTemplateName: "fpga-tmpl"},
+			},
+			want: []corev1ac.PodResourceClaimApplyConfiguration{
+				*corev1ac.PodResourceClaim().WithName("nic").WithResourceClaimTemplateName("nic-tmpl"),
+				*corev1ac.PodResourceClaim().WithName("gpu").WithResourceClaimTemplateName("gpu-tmpl"),
+				*corev1ac.PodResourceClaim().WithName("fpga").WithResourceClaimTemplateName("fpga-tmpl"),
+			},
+		},
+		"same-name claim is replaced in place": {
+			podSpec: corev1ac.PodSpec().WithResourceClaims(
+				corev1ac.PodResourceClaim().WithName("gpu").WithResourceClaimName("direct-claim"),
+				corev1ac.PodResourceClaim().WithName("nic").WithResourceClaimTemplateName("nic-tmpl"),
+			),
+			claims: []trainer.TrainerResourceClaim{
+				{Name: "gpu", ResourceClaimTemplateName: "gpu-tmpl"},
+			},
+			want: []corev1ac.PodResourceClaimApplyConfiguration{
+				*corev1ac.PodResourceClaim().WithName("gpu").WithResourceClaimTemplateName("gpu-tmpl"),
+				*corev1ac.PodResourceClaim().WithName("nic").WithResourceClaimTemplateName("nic-tmpl"),
+			},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			// Do not use t.Parallel() — SetFeatureGateDuringTest mutates global state.
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.TrainJobDynamicResourceAllocation, !tc.disableDRAGate)
+			applyTrainerPodResourceClaims(tc.podSpec, tc.claims)
+			if diff := cmp.Diff(tc.want, tc.podSpec.ResourceClaims); len(diff) != 0 {
+				t.Errorf("Unexpected pod resourceClaims (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestMergeTrainerNodeResources(t *testing.T) {
+	cases := map[string]struct {
+		runtimeNode      *corev1ac.ContainerApplyConfiguration
+		resourcesPerNode *corev1.ResourceRequirements
+		claims           []trainer.TrainerResourceClaim
+		want             corev1.ResourceRequirements
+		// disableDRAGate turns the TrainJobDynamicResourceAllocation feature gate off for the case.
+		disableDRAGate bool
+	}{
+		"feature gate disabled merges resourcesPerNode but ignores the claims": {
+			runtimeNode: corev1ac.Container().WithName(constants.Node).WithResources(
+				corev1ac.ResourceRequirements().WithRequests(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")}),
+			),
+			resourcesPerNode: &corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+			},
+			claims: []trainer.TrainerResourceClaim{{Name: "gpu", ResourceClaimTemplateName: "tmpl"}},
+			want: corev1.ResourceRequirements{
+				Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+			},
+			disableDRAGate: true,
+		},
+		"nil resourcesPerNode and no claims returns the runtime resources": {
+			runtimeNode: corev1ac.Container().WithName(constants.Node).WithResources(
+				corev1ac.ResourceRequirements().WithRequests(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")}),
+			),
+			want: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+			},
+		},
+		"resourcesPerNode merges requests and limits per key and keeps the runtime claims": {
+			runtimeNode: corev1ac.Container().WithName(constants.Node).WithResources(
+				corev1ac.ResourceRequirements().
+					WithRequests(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi")}).
+					WithClaims(corev1ac.ResourceClaim().WithName("nic")),
+			),
+			resourcesPerNode: &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")},
+				Limits:   corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("2")},
+			},
+			want: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4"), corev1.ResourceMemory: resource.MustParse("1Gi")},
+				Limits:   corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("2")},
+				Claims:   []corev1.ResourceClaim{{Name: "nic"}},
+			},
+		},
+		"claims are added to a container without resources": {
+			runtimeNode: corev1ac.Container().WithName(constants.Node),
+			claims:      []trainer.TrainerResourceClaim{{Name: "gpu", ResourceClaimTemplateName: "gpu-tmpl"}},
+			want: corev1.ResourceRequirements{
+				Claims: []corev1.ResourceClaim{{Name: "gpu"}},
+			},
+		},
+		"claims merge by name: runtime claims stay, an overridden entry is dropped with its request, new claims follow": {
+			runtimeNode: corev1ac.Container().WithName(constants.Node).WithResources(
+				corev1ac.ResourceRequirements().WithClaims(
+					corev1ac.ResourceClaim().WithName("nic"),
+					corev1ac.ResourceClaim().WithName("gpu").WithRequest("half"),
+				),
+			),
+			claims: []trainer.TrainerResourceClaim{
+				{Name: "gpu", ResourceClaimTemplateName: "gpu-tmpl"},
+				{Name: "fpga", ResourceClaimTemplateName: "fpga-tmpl"},
+			},
+			// "gpu" is overridden by resourceClaimsPerNode, so the runtime's request no longer applies.
+			want: corev1.ResourceRequirements{
+				Claims: []corev1.ResourceClaim{{Name: "gpu"}, {Name: "fpga"}, {Name: "nic"}},
+			},
+		},
+		"resourcesPerNode and claims are merged together": {
+			runtimeNode: corev1ac.Container().WithName(constants.Node).WithResources(
+				corev1ac.ResourceRequirements().
+					WithRequests(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")}).
+					WithClaims(corev1ac.ResourceClaim().WithName("nic")),
+			),
+			resourcesPerNode: &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
+			},
+			claims: []trainer.TrainerResourceClaim{{Name: "gpu", ResourceClaimTemplateName: "gpu-tmpl"}},
+			// A new claim with no match in the runtime list is placed first by strategic merge.
+			want: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
+				Claims:   []corev1.ResourceClaim{{Name: "gpu"}, {Name: "nic"}},
+			},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			// Do not use t.Parallel() — SetFeatureGateDuringTest mutates global state.
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.TrainJobDynamicResourceAllocation, !tc.disableDRAGate)
+			got, err := mergeTrainerNodeResources(tc.runtimeNode, tc.resourcesPerNode, tc.claims)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff(tc.want, got); len(diff) != 0 {
+				t.Errorf("Unexpected merged resources (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestToApplyConfig(t *testing.T) {
+	cases := map[string]struct {
+		res  corev1.ResourceRequirements
+		want *corev1ac.ResourceRequirementsApplyConfiguration
+	}{
+		"empty resources": {
+			want: corev1ac.ResourceRequirements(),
+		},
+		"requests, limits and claims are converted": {
+			res: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+				Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
+				Claims:   []corev1.ResourceClaim{{Name: "nic"}, {Name: "gpu", Request: "half"}},
+			},
+			want: corev1ac.ResourceRequirements().
+				WithRequests(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")}).
+				WithLimits(corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")}).
+				WithClaims(
+					corev1ac.ResourceClaim().WithName("nic"),
+					corev1ac.ResourceClaim().WithName("gpu").WithRequest("half"),
+				),
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if diff := cmp.Diff(tc.want, toApplyConfig(tc.res)); len(diff) != 0 {
+				t.Errorf("Unexpected apply configuration (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestNewRuntimeInfo(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.TrainJobDynamicResourceAllocation, true)
+
+	// newInfo builds the expected Info from the expected JobSet spec. Every case runs one node
+	// and one Pod per replicatedJob, so every PodSet has a count of 1.
+	newInfo := func(mlPolicy *trainer.MLPolicy, jobSetSpec jobsetv1alpha2.JobSetSpec) *jobruntimes.Info {
+		jobSetSpecApply, err := apply.FromTypedObjWithFields[jobsetv1alpha2ac.JobSetSpecApplyConfiguration](&jobsetv1alpha2.JobSet{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: jobsetv1alpha2.GroupVersion.String(),
+				Kind:       constants.JobSetKind,
+			},
+			Spec: jobSetSpec,
+		}, "spec")
+		if err != nil {
+			t.Fatal(err)
+		}
+		opts := []jobruntimes.InfoOption{
+			jobruntimes.WithMLPolicySource(mlPolicy),
+			jobruntimes.WithTemplateSpecObjApply(jobSetSpecApply),
+		}
+		for i, rJob := range jobSetSpec.ReplicatedJobs {
+			var ancestor *string
+			if labelAncestor, ok := rJob.Template.Labels[constants.LabelTrainJobAncestor]; ok {
+				ancestor = ptr.To(labelAncestor)
+			}
+			opts = append(opts, jobruntimes.WithPodSet(rJob.Name, ancestor, 1,
+				rJob.Template.Spec.Template.Spec, jobSetSpecApply.ReplicatedJobs[i].Template.Spec.Template.Spec))
+		}
+		return jobruntimes.NewInfo(opts...)
+	}
+
+	cases := map[string]struct {
+		trainJob       *trainer.TrainJob
+		jobSetTemplate trainer.JobSetTemplateSpec
+		mlPolicy       *trainer.MLPolicy
+		podGroupPolicy *trainer.PodGroupPolicy
+		wantInfo       *jobruntimes.Info
+		wantError      error
+	}{
+		"MPI resourcesPerNode is set on the node and not on the launcher when runLauncherAsNode is false": {
+			trainJob: testingutil.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
+				Trainer(testingutil.MakeTrainJobTrainerWrapper().
+					Container("", nil, nil, corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("4")}).
+					Obj(),
+				).
+				Obj(),
+			jobSetTemplate: trainer.JobSetTemplateSpec{
+				Spec: testingutil.MakeJobSetWrapper(metav1.NamespaceDefault, "test-job").
+					LauncherReplica().
+					ReplicatedJobLabel(constants.LabelTrainJobAncestor, constants.AncestorTrainer, constants.Launcher).
+					Obj().Spec,
+			},
+			mlPolicy: testingutil.MakeMLPolicyWrapper().
+				WithNumNodes(1).
+				WithMLPolicySource(*testingutil.MakeMLPolicySourceWrapper().
+					MPIPolicy(ptr.To[int32](1), trainer.MPIImplementationOpenMPI, ptr.To("/root/.ssh"), ptr.To(false)).
+					Obj(),
+				).
+				Obj(),
+			wantInfo: newInfo(
+				testingutil.MakeMLPolicyWrapper().
+					WithNumNodes(1).
+					WithMLPolicySource(*testingutil.MakeMLPolicySourceWrapper().
+						MPIPolicy(ptr.To[int32](1), trainer.MPIImplementationOpenMPI, ptr.To("/root/.ssh"), ptr.To(false)).
+						Obj(),
+					).
+					Obj(),
+				testingutil.MakeJobSetWrapper(metav1.NamespaceDefault, "test-job").
+					LauncherReplica().
+					ReplicatedJobLabel(constants.LabelTrainJobAncestor, constants.AncestorTrainer, constants.Launcher).
+					Container(constants.Node, constants.Node, "", nil, nil, corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("4")}).
+					Obj().Spec,
+			),
+		},
+		"MPI resourcesPerNode is set on the node and not on the launcher when runLauncherAsNode is unset": {
+			trainJob: testingutil.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
+				Trainer(testingutil.MakeTrainJobTrainerWrapper().
+					Container("", nil, nil, corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("4")}).
+					Obj(),
+				).
+				Obj(),
+			jobSetTemplate: trainer.JobSetTemplateSpec{
+				Spec: testingutil.MakeJobSetWrapper(metav1.NamespaceDefault, "test-job").
+					LauncherReplica().
+					ReplicatedJobLabel(constants.LabelTrainJobAncestor, constants.AncestorTrainer, constants.Launcher).
+					Obj().Spec,
+			},
+			mlPolicy: testingutil.MakeMLPolicyWrapper().
+				WithNumNodes(1).
+				WithMLPolicySource(*testingutil.MakeMLPolicySourceWrapper().
+					MPIPolicy(ptr.To[int32](1), trainer.MPIImplementationOpenMPI, ptr.To("/root/.ssh"), nil).
+					Obj(),
+				).
+				Obj(),
+			wantInfo: newInfo(
+				testingutil.MakeMLPolicyWrapper().
+					WithNumNodes(1).
+					WithMLPolicySource(*testingutil.MakeMLPolicySourceWrapper().
+						MPIPolicy(ptr.To[int32](1), trainer.MPIImplementationOpenMPI, ptr.To("/root/.ssh"), nil).
+						Obj(),
+					).
+					Obj(),
+				testingutil.MakeJobSetWrapper(metav1.NamespaceDefault, "test-job").
+					LauncherReplica().
+					ReplicatedJobLabel(constants.LabelTrainJobAncestor, constants.AncestorTrainer, constants.Launcher).
+					Container(constants.Node, constants.Node, "", nil, nil, corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("4")}).
+					Obj().Spec,
+			),
+		},
+		"MPI resourcesPerNode is set on the node and on the launcher when runLauncherAsNode is true": {
+			trainJob: testingutil.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
+				Trainer(testingutil.MakeTrainJobTrainerWrapper().
+					Container("", nil, nil, corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("4")}).
+					Obj(),
+				).
+				Obj(),
+			jobSetTemplate: trainer.JobSetTemplateSpec{
+				Spec: testingutil.MakeJobSetWrapper(metav1.NamespaceDefault, "test-job").
+					LauncherReplica().
+					ReplicatedJobLabel(constants.LabelTrainJobAncestor, constants.AncestorTrainer, constants.Launcher).
+					Obj().Spec,
+			},
+			mlPolicy: testingutil.MakeMLPolicyWrapper().
+				WithNumNodes(1).
+				WithMLPolicySource(*testingutil.MakeMLPolicySourceWrapper().
+					MPIPolicy(ptr.To[int32](1), trainer.MPIImplementationOpenMPI, ptr.To("/root/.ssh"), ptr.To(true)).
+					Obj(),
+				).
+				Obj(),
+			wantInfo: newInfo(
+				testingutil.MakeMLPolicyWrapper().
+					WithNumNodes(1).
+					WithMLPolicySource(*testingutil.MakeMLPolicySourceWrapper().
+						MPIPolicy(ptr.To[int32](1), trainer.MPIImplementationOpenMPI, ptr.To("/root/.ssh"), ptr.To(true)).
+						Obj(),
+					).
+					Obj(),
+				testingutil.MakeJobSetWrapper(metav1.NamespaceDefault, "test-job").
+					LauncherReplica().
+					ReplicatedJobLabel(constants.LabelTrainJobAncestor, constants.AncestorTrainer, constants.Launcher).
+					Container(constants.Node, constants.Node, "", nil, nil, corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("4")}).
+					Container(constants.Launcher, constants.Node, "", []string{"mpirun"}, []string{"echo.sh"}, corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("4")}).
+					Obj().Spec,
+			),
+		},
+		"MPI resourceClaimsPerNode is set on the node and not on the launcher when runLauncherAsNode is false": {
+			trainJob: testingutil.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
+				Trainer(testingutil.MakeTrainJobTrainerWrapper().
+					ResourceClaimsPerNode(trainer.TrainerResourceClaim{Name: "gpu", ResourceClaimTemplateName: "gpu-claim-template"}).
+					Obj(),
+				).
+				Obj(),
+			jobSetTemplate: trainer.JobSetTemplateSpec{
+				Spec: testingutil.MakeJobSetWrapper(metav1.NamespaceDefault, "test-job").
+					LauncherReplica().
+					ReplicatedJobLabel(constants.LabelTrainJobAncestor, constants.AncestorTrainer, constants.Launcher).
+					Obj().Spec,
+			},
+			mlPolicy: testingutil.MakeMLPolicyWrapper().
+				WithNumNodes(1).
+				WithMLPolicySource(*testingutil.MakeMLPolicySourceWrapper().
+					MPIPolicy(ptr.To[int32](1), trainer.MPIImplementationOpenMPI, ptr.To("/root/.ssh"), ptr.To(false)).
+					Obj(),
+				).
+				Obj(),
+			wantInfo: newInfo(
+				testingutil.MakeMLPolicyWrapper().
+					WithNumNodes(1).
+					WithMLPolicySource(*testingutil.MakeMLPolicySourceWrapper().
+						MPIPolicy(ptr.To[int32](1), trainer.MPIImplementationOpenMPI, ptr.To("/root/.ssh"), ptr.To(false)).
+						Obj(),
+					).
+					Obj(),
+				testingutil.MakeJobSetWrapper(metav1.NamespaceDefault, "test-job").
+					LauncherReplica().
+					ReplicatedJobLabel(constants.LabelTrainJobAncestor, constants.AncestorTrainer, constants.Launcher).
+					PodResourceClaims(constants.Node, corev1.PodResourceClaim{Name: "gpu", ResourceClaimTemplateName: ptr.To("gpu-claim-template")}).
+					ContainerResourceClaims(constants.Node, constants.Node, corev1.ResourceClaim{Name: "gpu"}).
+					Obj().Spec,
+			),
+		},
+		"MPI resourcesPerNode is merged with the resources of the runtime": {
+			trainJob: testingutil.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
+				Trainer(testingutil.MakeTrainJobTrainerWrapper().
+					Container("", nil, nil, corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("4")}).
+					Obj(),
+				).
+				Obj(),
+			jobSetTemplate: trainer.JobSetTemplateSpec{
+				Spec: testingutil.MakeJobSetWrapper(metav1.NamespaceDefault, "test-job").
+					LauncherReplica().
+					ReplicatedJobLabel(constants.LabelTrainJobAncestor, constants.AncestorTrainer, constants.Launcher).
+					Container(constants.Node, constants.Node, "", nil, nil, corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")}).
+					Obj().Spec,
+			},
+			mlPolicy: testingutil.MakeMLPolicyWrapper().
+				WithNumNodes(1).
+				WithMLPolicySource(*testingutil.MakeMLPolicySourceWrapper().
+					MPIPolicy(ptr.To[int32](1), trainer.MPIImplementationOpenMPI, ptr.To("/root/.ssh"), ptr.To(false)).
+					Obj(),
+				).
+				Obj(),
+			wantInfo: newInfo(
+				testingutil.MakeMLPolicyWrapper().
+					WithNumNodes(1).
+					WithMLPolicySource(*testingutil.MakeMLPolicySourceWrapper().
+						MPIPolicy(ptr.To[int32](1), trainer.MPIImplementationOpenMPI, ptr.To("/root/.ssh"), ptr.To(false)).
+						Obj(),
+					).
+					Obj(),
+				testingutil.MakeJobSetWrapper(metav1.NamespaceDefault, "test-job").
+					LauncherReplica().
+					ReplicatedJobLabel(constants.LabelTrainJobAncestor, constants.AncestorTrainer, constants.Launcher).
+					Container(constants.Node, constants.Node, "", nil, nil, corev1.ResourceList{
+						corev1.ResourceCPU: resource.MustParse("1"),
+						"nvidia.com/gpu":   resource.MustParse("4"),
+					}).
+					Obj().Spec,
+			),
+		},
+		"Torch resourcesPerNode is set on the trainer node": {
+			trainJob: testingutil.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
+				Trainer(testingutil.MakeTrainJobTrainerWrapper().
+					Container("", nil, nil, corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("4")}).
+					Obj(),
+				).
+				Obj(),
+			jobSetTemplate: trainer.JobSetTemplateSpec{
+				Spec: testingutil.MakeJobSetWrapper(metav1.NamespaceDefault, "test-job").
+					Obj().Spec,
+			},
+			mlPolicy: testingutil.MakeMLPolicyWrapper().
+				WithNumNodes(1).
+				WithMLPolicySource(*testingutil.MakeMLPolicySourceWrapper().TorchPolicy().Obj()).
+				Obj(),
+			wantInfo: newInfo(
+				testingutil.MakeMLPolicyWrapper().
+					WithNumNodes(1).
+					WithMLPolicySource(*testingutil.MakeMLPolicySourceWrapper().TorchPolicy().Obj()).
+					Obj(),
+				testingutil.MakeJobSetWrapper(metav1.NamespaceDefault, "test-job").
+					Container(constants.Node, constants.Node, "", nil, nil, corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("4")}).
+					Obj().Spec,
+			),
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, err := (&TrainingRuntime{}).newRuntimeInfo(tc.trainJob, tc.jobSetTemplate, tc.mlPolicy, tc.podGroupPolicy, nil)
+			if diff := cmp.Diff(tc.wantError, err, cmpopts.EquateErrors()); len(diff) != 0 {
+				t.Errorf("Unexpected error (-want,+got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tc.wantInfo, got, cmpopts.EquateEmpty()); len(diff) != 0 {
+				t.Errorf("Unexpected Info (-want,+got):\n%s", diff)
 			}
 		})
 	}

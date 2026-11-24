@@ -1,3 +1,17 @@
+# Copyright The Kubeflow Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # coding: utf-8
 
 """
@@ -32,8 +46,19 @@ class IoK8sApiCoreV1HTTPGetAction(BaseModel):
     http_headers: Optional[List[IoK8sApiCoreV1HTTPHeader]] = Field(default=None, description="Custom headers to set in the request. HTTP allows repeated headers.", alias="httpHeaders")
     path: Optional[StrictStr] = Field(default=None, description="Path to access on the HTTP server.")
     port: IoK8sApimachineryPkgUtilIntstrIntOrString = Field(description="Name or number of the port to access on the container. Number must be in the range 1 to 65535. Name must be an IANA_SVC_NAME.")
+    protocol: Optional[StrictStr] = Field(default=None, description="Protocol selects the wire protocol for the probe connection. Nil defaults to HTTP/1.1.  Possible enum values:  - `\"HTTP1\"` uses HTTP/1.1 (the existing default).  - `\"HTTP2\"` uses HTTP/2. Currently, only cleartext with prior knowledge (h2c) is supported, and must be used with scheme HTTP.")
     scheme: Optional[StrictStr] = Field(default=None, description="Scheme to use for connecting to the host. Defaults to HTTP.  Possible enum values:  - `\"HTTP\"` means that the scheme used will be http://  - `\"HTTPS\"` means that the scheme used will be https://")
-    __properties: ClassVar[List[str]] = ["host", "httpHeaders", "path", "port", "scheme"]
+    __properties: ClassVar[List[str]] = ["host", "httpHeaders", "path", "port", "protocol", "scheme"]
+
+    @field_validator('protocol')
+    def protocol_validate_enum(cls, value):
+        """Validates the enum"""
+        if value is None:
+            return value
+
+        if value not in set(['HTTP1', 'HTTP2']):
+            raise ValueError("must be one of enum values ('HTTP1', 'HTTP2')")
+        return value
 
     @field_validator('scheme')
     def scheme_validate_enum(cls, value):
@@ -110,6 +135,7 @@ class IoK8sApiCoreV1HTTPGetAction(BaseModel):
             "httpHeaders": [IoK8sApiCoreV1HTTPHeader.from_dict(_item) for _item in obj["httpHeaders"]] if obj.get("httpHeaders") is not None else None,
             "path": obj.get("path"),
             "port": IoK8sApimachineryPkgUtilIntstrIntOrString.from_dict(obj["port"]) if obj.get("port") is not None else None,
+            "protocol": obj.get("protocol"),
             "scheme": obj.get("scheme")
         })
         return _obj

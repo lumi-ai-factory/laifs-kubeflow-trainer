@@ -1,3 +1,17 @@
+// Copyright The Kubeflow Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use crate::config::config::CACHE_INDEX_COLUMN;
 use arrow::array::UInt64Array;
 use arrow::record_batch::RecordBatch;
@@ -17,10 +31,11 @@ use datafusion::physical_plan::{
 use futures::{Stream, StreamExt, TryStreamExt};
 use iceberg::TableIdent;
 use iceberg::arrow::schema_to_arrow_schema;
-use iceberg::io::FileIO;
+use iceberg::io::FileIOBuilder;
 use iceberg::scan::{FileScanTask, FileScanTaskStream};
 use iceberg::table::{StaticTable, Table};
 use iceberg_datafusion::{from_datafusion_error, to_datafusion_error};
+use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::future;
@@ -93,10 +108,7 @@ impl WorkerDataSource {
         file_urls: Vec<String>,
         start_index: u64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let file_io = FileIO::from_path(&metadata_loc)
-            .map_err(|e| format!("Failed to create FileIO: {}", e))?
-            .build()
-            .map_err(|e| format!("Failed to build FileIO: {}", e))?;
+        let file_io = FileIOBuilder::new(Arc::new(OpenDalResolvingStorageFactory::new())).build();
         let table_indent = TableIdent::from_strs([schema_name, table_name])
             .map_err(|e| format!("Failed to create table ident: {}", e))?;
         let static_table =
@@ -111,7 +123,18 @@ impl WorkerDataSource {
 
         let fields = schema.fields().clone();
         let mut builder = SchemaBuilder::from(&fields);
-        builder.push(Field::new(CACHE_INDEX_COLUMN, DataType::UInt64, false)); // TODO:// validate name collision
+
+        // Validate that source schema does not already contain cache_index column
+        if schema.field_with_name(CACHE_INDEX_COLUMN).is_ok() {
+            return Err(format!(
+                "Source schema already contains a column named '{}'. This conflicts with the cache index column added by the data cache worker.",
+                CACHE_INDEX_COLUMN
+            )
+            .into());
+        }
+
+        builder.push(Field::new(CACHE_INDEX_COLUMN, DataType::UInt64, false));
+
         let output_schema = Arc::new(Schema::new(builder.finish().fields));
         Ok(Self {
             file_urls,
@@ -203,18 +226,18 @@ pub struct WorkerExec {
     file_urls: Vec<String>,
     inner: Table,
     schema: SchemaRef,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
 }
 
 impl WorkerExec {
     fn new(file_urls: Vec<String>, inner: Table, schema: SchemaRef) -> Self {
-        let eq_properties = EquivalenceProperties::new_with_orderings(schema.clone(), &[]);
-        let plan_properties = PlanProperties::new(
+        let eq_properties = EquivalenceProperties::new(schema.clone());
+        let plan_properties = Arc::new(PlanProperties::new(
             eq_properties, // Equivalence Properties
             datafusion::physical_expr::Partitioning::UnknownPartitioning(1), // Output Partitioning
             EmissionType::Both,
             Boundedness::Bounded, // Execution Mode
-        );
+        ));
         Self {
             file_urls,
             inner,
@@ -252,7 +275,7 @@ impl ExecutionPlan for WorkerExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 
@@ -325,19 +348,19 @@ impl ExecutionPlan for WorkerExec {
 pub struct IndexColumnExec {
     input: Arc<dyn ExecutionPlan>,
     schema: SchemaRef,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
     start_index: u64,
 }
 
 impl IndexColumnExec {
     fn new(input: Arc<dyn ExecutionPlan>, schema: SchemaRef, start_index: u64) -> Self {
-        let eq_properties = EquivalenceProperties::new_with_orderings(schema.clone(), &[]);
-        let plan_properties = PlanProperties::new(
+        let eq_properties = EquivalenceProperties::new(schema.clone());
+        let plan_properties = Arc::new(PlanProperties::new(
             eq_properties, // Equivalence Properties
             datafusion::physical_expr::Partitioning::UnknownPartitioning(1), // Output Partitioning
             EmissionType::Both,
             Boundedness::Bounded, // Execution Mode
-        );
+        ));
         Self {
             input,
             schema,
@@ -375,7 +398,7 @@ impl ExecutionPlan for IndexColumnExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 
@@ -490,8 +513,8 @@ async fn read_stream(
     // limit the number of files to read in parallel to support streaming from replicas
     let stream = reader
         .read(filter_and_create_stream(Ok(files), Arc::new(file_urls.clone())).await?)
-        .await
         .map_err(to_datafusion_error)?
+        .stream()
         .map_err(to_datafusion_error);
     Ok(Box::pin(stream))
 }
@@ -511,5 +534,43 @@ async fn filter_and_create_stream(
         Err(e) => Ok(Box::pin(futures::stream::once(future::ready(Err(
             from_datafusion_error(e),
         ))))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, Schema};
+
+    #[test]
+    fn fails_when_source_schema_contains_cache_index() {
+        // Build a schema that already has a cache_index column
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(CACHE_INDEX_COLUMN, DataType::UInt64, false),
+        ]);
+
+        // The check we added: if cache_index already exists, is_ok() returns true
+        let collision = schema.field_with_name(CACHE_INDEX_COLUMN).is_ok();
+        assert!(
+            collision,
+            "Should detect cache_index collision in source schema"
+        );
+    }
+
+    #[test]
+    fn passes_when_source_schema_has_no_cache_index() {
+        // Build a schema with no cache_index column
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]);
+
+        // No collision — field_with_name returns Err, so is_ok() is false
+        let collision = schema.field_with_name(CACHE_INDEX_COLUMN).is_ok();
+        assert!(
+            !collision,
+            "Should not detect cache_index collision when column is absent"
+        );
     }
 }

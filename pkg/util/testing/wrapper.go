@@ -338,6 +338,15 @@ func (j *JobSetWrapper) SchedulingGates(rJobName string, schedulingGates ...core
 	return j
 }
 
+func (j *JobSetWrapper) TerminationGracePeriodSeconds(rJobName string, seconds int64) *JobSetWrapper {
+	for i, rJob := range j.Spec.ReplicatedJobs {
+		if rJob.Name == rJobName {
+			j.Spec.ReplicatedJobs[i].Template.Spec.Template.Spec.TerminationGracePeriodSeconds = &seconds
+		}
+	}
+	return j
+}
+
 func (j *JobSetWrapper) ImagePullSecrets(rJobName string, imagePullSecrets ...corev1.LocalObjectReference) *JobSetWrapper {
 	for i, rJob := range j.Spec.ReplicatedJobs {
 		if rJob.Name == rJobName {
@@ -399,6 +408,38 @@ func (j *JobSetWrapper) VolumeMounts(rJobName, containerName string, vms ...core
 	return j
 }
 
+func (j *JobSetWrapper) PodResourceClaims(rJobName string, claims ...corev1.PodResourceClaim) *JobSetWrapper {
+	for i, rJob := range j.Spec.ReplicatedJobs {
+		if rJob.Name == rJobName {
+			j.Spec.ReplicatedJobs[i].Template.Spec.Template.Spec.ResourceClaims = append(
+				j.Spec.ReplicatedJobs[i].Template.Spec.Template.Spec.ResourceClaims,
+				claims...,
+			)
+		}
+	}
+	return j
+}
+
+func (j *JobSetWrapper) ContainerResourceClaims(rJobName, containerName string, claims ...corev1.ResourceClaim) *JobSetWrapper {
+	for i, rJob := range j.Spec.ReplicatedJobs {
+		if rJob.Name != rJobName {
+			continue
+		}
+		podSpec := &j.Spec.ReplicatedJobs[i].Template.Spec.Template.Spec
+		for k := range podSpec.InitContainers {
+			if podSpec.InitContainers[k].Name == containerName {
+				podSpec.InitContainers[k].Resources.Claims = append(podSpec.InitContainers[k].Resources.Claims, claims...)
+			}
+		}
+		for k := range podSpec.Containers {
+			if podSpec.Containers[k].Name == containerName {
+				podSpec.Containers[k].Resources.Claims = append(podSpec.Containers[k].Resources.Claims, claims...)
+			}
+		}
+	}
+	return j
+}
+
 func (j *JobSetWrapper) Env(rJobName, containerName string, envs ...corev1.EnvVar) *JobSetWrapper {
 	for i, rJob := range j.Spec.ReplicatedJobs {
 		if rJob.Name == rJobName {
@@ -439,6 +480,15 @@ func (j *JobSetWrapper) EnvFrom(rJobName, containerName string, envFrom ...corev
 					)
 				}
 			}
+		}
+	}
+	return j
+}
+
+func (j *JobSetWrapper) SchedulerName(rJobName, schedulerName string) *JobSetWrapper {
+	for i, rJob := range j.Spec.ReplicatedJobs {
+		if rJob.Name == rJobName {
+			j.Spec.ReplicatedJobs[i].Template.Spec.Template.Spec.SchedulerName = schedulerName
 		}
 	}
 	return j
@@ -585,6 +635,94 @@ type TrainJobWrapper struct {
 	trainer.TrainJob
 }
 
+// OptimizationJobWrapper provides a fluent builder for OptimizationJob test objects.
+type OptimizationJobWrapper struct {
+	trainer.OptimizationJob
+}
+
+// MakeOptimizationJobWrapper creates an OptimizationJob with the supplied namespace and name.
+// The spec is populated with a minimal valid random search so callers only override what they test.
+func MakeOptimizationJobWrapper(namespace, name string) *OptimizationJobWrapper {
+	return &OptimizationJobWrapper{
+		OptimizationJob: trainer.OptimizationJob{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: trainer.SchemeGroupVersion.String(),
+				Kind:       trainer.OptimizationJobKind,
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace,
+				Name:      name,
+			},
+			Spec: trainer.OptimizationJobSpec{
+				NumTrials:      1,
+				ParallelTrials: 1,
+				Objectives: []trainer.Objective{{
+					Metric:    "accuracy",
+					Direction: trainer.ObjectiveDirectionMaximize,
+				}},
+				SearchAlgorithm: &trainer.SearchAlgorithm{
+					Random: &trainer.RandomAlgorithm{},
+				},
+				Parameters: []trainer.Parameter{{
+					Name: "lr",
+					SearchSpace: &trainer.SearchSpace{
+						Uniform: trainer.UniformSpace{
+							Min: "0.001",
+							Max: "0.1",
+						},
+					},
+				}},
+				TrainJobTemplate: trainer.TrainJobTemplateSpec{
+					Spec: trainer.TrainJobSpec{
+						RuntimeRef: trainer.RuntimeRef{Name: "runtime"},
+					},
+				},
+			},
+		},
+	}
+}
+
+// NumTrials sets the total number of trials to run.
+func (o *OptimizationJobWrapper) NumTrials(numTrials int32) *OptimizationJobWrapper {
+	o.Spec.NumTrials = numTrials
+	return o
+}
+
+// ParallelTrials sets the number of trials to run concurrently.
+func (o *OptimizationJobWrapper) ParallelTrials(parallelTrials int32) *OptimizationJobWrapper {
+	o.Spec.ParallelTrials = parallelTrials
+	return o
+}
+
+// SearchAlgorithm sets the search algorithm configuration.
+func (o *OptimizationJobWrapper) SearchAlgorithm(searchAlgorithm *trainer.SearchAlgorithm) *OptimizationJobWrapper {
+	o.Spec.SearchAlgorithm = searchAlgorithm
+	return o
+}
+
+// Objectives sets the metrics to optimize.
+func (o *OptimizationJobWrapper) Objectives(objectives ...trainer.Objective) *OptimizationJobWrapper {
+	o.Spec.Objectives = objectives
+	return o
+}
+
+// Parameters sets the hyperparameter search spaces.
+func (o *OptimizationJobWrapper) Parameters(parameters ...trainer.Parameter) *OptimizationJobWrapper {
+	o.Spec.Parameters = parameters
+	return o
+}
+
+// TrainJobTemplate sets the template used to create trial TrainJobs.
+func (o *OptimizationJobWrapper) TrainJobTemplate(template trainer.TrainJobTemplateSpec) *OptimizationJobWrapper {
+	o.Spec.TrainJobTemplate = template
+	return o
+}
+
+// Obj returns the constructed OptimizationJob.
+func (o *OptimizationJobWrapper) Obj() *trainer.OptimizationJob {
+	return &o.OptimizationJob
+}
+
 func MakeTrainJobWrapper(namespace, name string) *TrainJobWrapper {
 	return &TrainJobWrapper{
 		TrainJob: trainer.TrainJob{
@@ -650,6 +788,18 @@ func (t *TrainJobWrapper) ManagedBy(m string) *TrainJobWrapper {
 	return t
 }
 
+func (t *TrainJobWrapper) CreationTimestamp(creationTimestamp metav1.Time) *TrainJobWrapper {
+	t.ObjectMeta.CreationTimestamp = creationTimestamp
+	return t
+}
+
+func (t *TrainJobWrapper) Conditions(conditions ...metav1.Condition) *TrainJobWrapper {
+	if len(conditions) != 0 {
+		t.Status.Conditions = append(t.Status.Conditions, conditions...)
+	}
+	return t
+}
+
 func (t *TrainJobWrapper) Obj() *trainer.TrainJob {
 	return &t.TrainJob
 }
@@ -686,6 +836,11 @@ func (t *TrainJobTrainerWrapper) Container(image string, command []string, args 
 
 func (t *TrainJobTrainerWrapper) Env(env ...corev1.EnvVar) *TrainJobTrainerWrapper {
 	t.Trainer.Env = env
+	return t
+}
+
+func (t *TrainJobTrainerWrapper) ResourceClaimsPerNode(claims ...trainer.TrainerResourceClaim) *TrainJobTrainerWrapper {
+	t.Trainer.ResourceClaimsPerNode = claims
 	return t
 }
 
@@ -1130,10 +1285,31 @@ func (s *TrainingRuntimeSpecWrapper) LauncherReplica() *TrainingRuntimeSpecWrapp
 	return s
 }
 
+func (s *TrainingRuntimeSpecWrapper) DependsOn(
+	rJobName string,
+	dependsOn ...jobsetv1alpha2.DependsOn,
+) *TrainingRuntimeSpecWrapper {
+	for i, rJob := range s.Template.Spec.ReplicatedJobs {
+		if rJob.Name == rJobName {
+			s.Template.Spec.ReplicatedJobs[i].DependsOn = dependsOn
+		}
+	}
+	return s
+}
+
 func (s *TrainingRuntimeSpecWrapper) Replicas(replicas int32, rJobNames ...string) *TrainingRuntimeSpecWrapper {
 	for i, rJob := range s.Template.Spec.ReplicatedJobs {
 		if slices.Contains(rJobNames, rJob.Name) {
 			s.Template.Spec.ReplicatedJobs[i].Replicas = replicas
+		}
+	}
+	return s
+}
+
+func (s *TrainingRuntimeSpecWrapper) SchedulerName(rJobName, schedulerName string) *TrainingRuntimeSpecWrapper {
+	for i, rJob := range s.Template.Spec.ReplicatedJobs {
+		if rJob.Name == rJobName {
+			s.Template.Spec.ReplicatedJobs[i].Template.Spec.Template.Spec.SchedulerName = schedulerName
 		}
 	}
 	return s
@@ -1198,12 +1374,52 @@ func (s *TrainingRuntimeSpecWrapper) Env(rJobName, containerName string, envs ..
 	return s
 }
 
+func (s *TrainingRuntimeSpecWrapper) PodResourceClaims(rJobName string, claims ...corev1.PodResourceClaim) *TrainingRuntimeSpecWrapper {
+	for i, rJob := range s.Template.Spec.ReplicatedJobs {
+		if rJob.Name == rJobName {
+			s.Template.Spec.ReplicatedJobs[i].Template.Spec.Template.Spec.ResourceClaims = append(
+				s.Template.Spec.ReplicatedJobs[i].Template.Spec.Template.Spec.ResourceClaims,
+				claims...,
+			)
+		}
+	}
+	return s
+}
+
+func (s *TrainingRuntimeSpecWrapper) ContainerResourceClaims(rJobName, containerName string, claims ...corev1.ResourceClaim) *TrainingRuntimeSpecWrapper {
+	for i, rJob := range s.Template.Spec.ReplicatedJobs {
+		if rJob.Name != rJobName {
+			continue
+		}
+		podSpec := &s.Template.Spec.ReplicatedJobs[i].Template.Spec.Template.Spec
+		for k := range podSpec.InitContainers {
+			if podSpec.InitContainers[k].Name == containerName {
+				podSpec.InitContainers[k].Resources.Claims = append(podSpec.InitContainers[k].Resources.Claims, claims...)
+			}
+		}
+		for k := range podSpec.Containers {
+			if podSpec.Containers[k].Name == containerName {
+				podSpec.Containers[k].Resources.Claims = append(podSpec.Containers[k].Resources.Claims, claims...)
+			}
+		}
+	}
+	return s
+}
+
 func (s *TrainingRuntimeSpecWrapper) PodGroupPolicyCoscheduling(src *trainer.CoschedulingPodGroupPolicySource) *TrainingRuntimeSpecWrapper {
 	s.PodGroupPolicy = &trainer.PodGroupPolicy{
 		PodGroupPolicySource: trainer.PodGroupPolicySource{
 			Coscheduling: src,
 		},
 	}
+	return s
+}
+
+func (s *TrainingRuntimeSpecWrapper) PodGroupPolicyVolcano(src *trainer.VolcanoPodGroupPolicySource) *TrainingRuntimeSpecWrapper {
+	if s.PodGroupPolicy == nil {
+		s.PodGroupPolicy = &trainer.PodGroupPolicy{}
+	}
+	s.PodGroupPolicy.Volcano = src
 	return s
 }
 
@@ -1214,6 +1430,11 @@ func (s *TrainingRuntimeSpecWrapper) PodGroupPolicyCoschedulingSchedulingTimeout
 		})
 	}
 	s.PodGroupPolicy.Coscheduling.ScheduleTimeoutSeconds = &timeout
+	return s
+}
+
+func (s *TrainingRuntimeSpecWrapper) Scheduling(scheduling *trainer.TrainingRuntimeScheduling) *TrainingRuntimeSpecWrapper {
+	s.TrainingRuntimeSpec.Scheduling = scheduling
 	return s
 }
 
@@ -1258,6 +1479,11 @@ func (m *MLPolicySourceWrapper) TorchPolicy() *MLPolicySourceWrapper {
 	return m
 }
 
+func (m *MLPolicySourceWrapper) TorchPolicyWithEnvInjection(envInjection *trainer.EnvInjection) *MLPolicySourceWrapper {
+	m.Torch = &trainer.TorchMLPolicySource{EnvInjection: envInjection}
+	return m
+}
+
 func (w *MLPolicySourceWrapper) JAXPolicy() *MLPolicySourceWrapper {
 	w.JAX = &trainer.JAXMLPolicySource{}
 	return w
@@ -1276,6 +1502,14 @@ func (m *MLPolicySourceWrapper) MPIPolicy(numProcPerNode *int32, MPImplementatio
 	m.MPI.MPIImplementation = &MPImplementation
 	m.MPI.SSHAuthMountPath = sshAuthMountPath
 	m.MPI.RunLauncherAsNode = runLauncherAsNode
+	return m
+}
+
+func (m *MLPolicySourceWrapper) FluxPolicy(numProcPerNode *int32) *MLPolicySourceWrapper {
+	if m.Flux == nil {
+		m.Flux = &trainer.FluxMLPolicySource{}
+	}
+	m.Flux.NumProcPerNode = numProcPerNode
 	return m
 }
 

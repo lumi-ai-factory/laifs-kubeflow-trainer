@@ -17,9 +17,11 @@ limitations under the License.
 package config
 
 import (
+	"crypto/tls"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,9 +29,11 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/rest"
 	componentconfigv1alpha1 "k8s.io/component-base/config/v1alpha1"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	runtimeconfig "sigs.k8s.io/controller-runtime/pkg/config"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
@@ -76,8 +80,8 @@ apiVersion: config.trainer.kubeflow.org/v1alpha1
 kind: Configuration
 certManagement:
   enable: true
-  webhookServiceName: custom-webhook-service
-  webhookSecretName: custom-webhook-secret
+  serviceName: custom-webhook-service
+  secretName: custom-webhook-secret
 `), os.FileMode(0600)); err != nil {
 		t.Fatal(err)
 	}
@@ -195,8 +199,8 @@ controller:
     TrainingRuntime.trainer.kubeflow.org: 1
 certManagement:
   enable: true
-  webhookServiceName: kubeflow-trainer-controller-manager
-  webhookSecretName: kubeflow-trainer-webhook-cert
+  serviceName: kubeflow-trainer-controller-manager
+  secretName: kubeflow-trainer-webhook-cert
 clientConnection:
   qps: 50
   burst: 100
@@ -270,9 +274,9 @@ this is not: valid: yaml: content
 	}
 
 	defaultCertManagement := &configapi.CertManagement{
-		Enable:             ptr.To(true),
-		WebhookServiceName: "kubeflow-trainer-controller-manager",
-		WebhookSecretName:  "kubeflow-trainer-webhook-cert",
+		Enable:      ptr.To(true),
+		ServiceName: "kubeflow-trainer-controller-manager",
+		SecretName:  "kubeflow-trainer-webhook-cert",
 	}
 
 	defaultClientConnection := &configapi.ClientConnection{
@@ -293,6 +297,7 @@ this is not: valid: yaml: content
 	defaultMetrics := configapi.ControllerMetrics{
 		BindAddress:   ":8443",
 		SecureServing: ptr.To(true),
+		Auth:          &configapi.MetricsAuthConfig{Enabled: ptr.To(false)},
 	}
 
 	defaultHealth := configapi.ControllerHealth{
@@ -301,11 +306,14 @@ this is not: valid: yaml: content
 		LivenessEndpointName:   "healthz",
 	}
 
+	// When SecureServing is true the built-in metrics server is disabled (BindAddress="0")
+	// and a manual TLS server is started later in setupManagerComponents.
 	defaultOptions := ctrl.Options{
 		HealthProbeBindAddress: ":8081",
+		ReadinessEndpointName:  "/readyz",
+		LivenessEndpointName:   "/healthz",
 		Metrics: metricsserver.Options{
-			BindAddress:   ":8443",
-			SecureServing: true,
+			BindAddress: "0",
 		},
 		WebhookServer: &webhook.DefaultServer{
 			Options: webhook.Options{
@@ -319,6 +327,7 @@ this is not: valid: yaml: content
 		cmpopts.IgnoreUnexported(ctrl.Options{}, webhook.DefaultServer{}, net.ListenConfig{}),
 		cmpopts.IgnoreFields(ctrl.Options{}, "Scheme", "Logger", "Cache"),
 		cmpopts.IgnoreFields(runtimeconfig.Controller{}, "Logger"),
+		cmpopts.IgnoreFields(client.Options{}, "Log"),
 		cmpopts.IgnoreFields(metricsserver.Options{}, "TLSOpts"),
 		cmpopts.IgnoreFields(webhook.Options{}, "TLSOpts"),
 	}
@@ -383,6 +392,7 @@ this is not: valid: yaml: content
 				Metrics: configapi.ControllerMetrics{
 					BindAddress:   ":9443",
 					SecureServing: ptr.To(true),
+					Auth:          &configapi.MetricsAuthConfig{Enabled: ptr.To(false)},
 				},
 				Health: configapi.ControllerHealth{
 					HealthProbeBindAddress: ":8082",
@@ -398,9 +408,10 @@ this is not: valid: yaml: content
 			},
 			wantOptions: ctrl.Options{
 				HealthProbeBindAddress: ":8082",
+				ReadinessEndpointName:  "/readyz",
+				LivenessEndpointName:   "/healthz",
 				Metrics: metricsserver.Options{
-					BindAddress:   ":9443",
-					SecureServing: true,
+					BindAddress: "0",
 				},
 				WebhookServer: &webhook.DefaultServer{
 					Options: webhook.Options{
@@ -432,9 +443,10 @@ this is not: valid: yaml: content
 			},
 			wantOptions: ctrl.Options{
 				HealthProbeBindAddress: ":8081",
+				ReadinessEndpointName:  "/readyz",
+				LivenessEndpointName:   "/healthz",
 				Metrics: metricsserver.Options{
-					BindAddress:   ":8443",
-					SecureServing: true,
+					BindAddress: "0",
 				},
 				WebhookServer: &webhook.DefaultServer{
 					Options: webhook.Options{
@@ -471,9 +483,10 @@ this is not: valid: yaml: content
 			},
 			wantOptions: ctrl.Options{
 				HealthProbeBindAddress: ":8081",
+				ReadinessEndpointName:  "/readyz",
+				LivenessEndpointName:   "/healthz",
 				Metrics: metricsserver.Options{
-					BindAddress:   ":8443",
-					SecureServing: true,
+					BindAddress: "0",
 				},
 				WebhookServer: &webhook.DefaultServer{
 					Options: webhook.Options{
@@ -500,9 +513,9 @@ this is not: valid: yaml: content
 				ClientConnection: defaultClientConnection,
 				StatusServer:     defaultStatusServer,
 				CertManagement: &configapi.CertManagement{
-					Enable:             ptr.To(true),
-					WebhookServiceName: "custom-webhook-service",
-					WebhookSecretName:  "custom-webhook-secret",
+					Enable:      ptr.To(true),
+					ServiceName: "custom-webhook-service",
+					SecretName:  "custom-webhook-secret",
 				},
 			},
 			wantOptions: defaultOptions,
@@ -518,9 +531,9 @@ this is not: valid: yaml: content
 				ClientConnection: defaultClientConnection,
 				StatusServer:     defaultStatusServer,
 				CertManagement: &configapi.CertManagement{
-					Enable:             ptr.To(false),
-					WebhookServiceName: "kubeflow-trainer-controller-manager",
-					WebhookSecretName:  "kubeflow-trainer-webhook-cert",
+					Enable:      ptr.To(false),
+					ServiceName: "kubeflow-trainer-controller-manager",
+					SecretName:  "kubeflow-trainer-webhook-cert",
 				},
 			},
 			wantOptions: defaultOptions,
@@ -534,6 +547,7 @@ this is not: valid: yaml: content
 				Metrics: configapi.ControllerMetrics{
 					BindAddress:   ":8080",
 					SecureServing: ptr.To(false),
+					Auth:          &configapi.MetricsAuthConfig{Enabled: ptr.To(false)},
 				},
 				Health:           defaultHealth,
 				CertManagement:   defaultCertManagement,
@@ -542,9 +556,10 @@ this is not: valid: yaml: content
 			},
 			wantOptions: ctrl.Options{
 				HealthProbeBindAddress: ":8081",
+				ReadinessEndpointName:  "/readyz",
+				LivenessEndpointName:   "/healthz",
 				Metrics: metricsserver.Options{
-					BindAddress:   ":8080",
-					SecureServing: false,
+					BindAddress: "0",
 				},
 				WebhookServer: &webhook.DefaultServer{
 					Options: webhook.Options{
@@ -570,9 +585,10 @@ this is not: valid: yaml: content
 			},
 			wantOptions: ctrl.Options{
 				HealthProbeBindAddress: ":8081",
+				ReadinessEndpointName:  "/readyz",
+				LivenessEndpointName:   "/healthz",
 				Metrics: metricsserver.Options{
-					BindAddress:   ":8443",
-					SecureServing: true,
+					BindAddress: "0",
 				},
 				WebhookServer: &webhook.DefaultServer{
 					Options: webhook.Options{
@@ -600,9 +616,10 @@ this is not: valid: yaml: content
 			},
 			wantOptions: ctrl.Options{
 				HealthProbeBindAddress: ":8081",
+				ReadinessEndpointName:  "/readyz",
+				LivenessEndpointName:   "/healthz",
 				Metrics: metricsserver.Options{
-					BindAddress:   ":8443",
-					SecureServing: true,
+					BindAddress: "0",
 				},
 				WebhookServer: &webhook.DefaultServer{
 					Options: webhook.Options{
@@ -629,9 +646,10 @@ this is not: valid: yaml: content
 			},
 			wantOptions: ctrl.Options{
 				HealthProbeBindAddress: ":9090",
+				ReadinessEndpointName:  "/ready",
+				LivenessEndpointName:   "/alive",
 				Metrics: metricsserver.Options{
-					BindAddress:   ":8443",
-					SecureServing: true,
+					BindAddress: "0",
 				},
 				WebhookServer: &webhook.DefaultServer{
 					Options: webhook.Options{
@@ -676,9 +694,10 @@ this is not: valid: yaml: content
 			},
 			wantOptions: ctrl.Options{
 				HealthProbeBindAddress: ":8081",
+				ReadinessEndpointName:  "/readyz",
+				LivenessEndpointName:   "/healthz",
 				Metrics: metricsserver.Options{
-					BindAddress:   ":8443",
-					SecureServing: true,
+					BindAddress: "0",
 				},
 				WebhookServer: &webhook.DefaultServer{
 					Options: webhook.Options{
@@ -730,7 +749,7 @@ this is not: valid: yaml: content
 
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
-			options, cfg, err := Load(testScheme, tc.configFile, false)
+			options, cfg, err := Load(testScheme, tc.configFile)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatal("Expected error but got none")
@@ -745,6 +764,34 @@ this is not: valid: yaml: content
 			}
 			if diff := cmp.Diff(tc.wantOptions, options, ctrlOptsCmpOpts...); diff != "" {
 				t.Errorf("Unexpected options (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestHealthEndpointPath(t *testing.T) {
+	testcases := map[string]struct {
+		endpointName string
+		want         string
+	}{
+		"name without leading slash": {
+			endpointName: "readyz",
+			want:         "/readyz",
+		},
+		"name with leading slash": {
+			endpointName: "/readyz",
+			want:         "/readyz",
+		},
+		"empty name is left to controller-runtime defaulting": {
+			endpointName: "",
+			want:         "",
+		},
+	}
+
+	for name, tc := range testcases {
+		t.Run(name, func(t *testing.T) {
+			if got := healthEndpointPath(tc.endpointName); got != tc.want {
+				t.Errorf("healthEndpointPath(%q) = %q, want %q", tc.endpointName, got, tc.want)
 			}
 		})
 	}
@@ -798,40 +845,241 @@ func TestIsCertManagementEnabled(t *testing.T) {
 	}
 }
 
-func TestLoadHTTP2(t *testing.T) {
+func TestApplyClientConnection(t *testing.T) {
+	testcases := map[string]struct {
+		cfg          configapi.Configuration
+		initialQPS   float32
+		initialBurst int
+		wantQPS      float32
+		wantBurst    int
+	}{
+		"nil ClientConnection keeps rest.Config defaults": {
+			cfg:          configapi.Configuration{},
+			initialQPS:   5,
+			initialBurst: 10,
+			wantQPS:      5,
+			wantBurst:    10,
+		},
+		"default values override client-go defaults": {
+			cfg: configapi.Configuration{
+				ClientConnection: &configapi.ClientConnection{
+					QPS:   ptr.To[float32](50),
+					Burst: ptr.To[int32](100),
+				},
+			},
+			initialQPS:   5,
+			initialBurst: 10,
+			wantQPS:      50,
+			wantBurst:    100,
+		},
+		"custom values applied": {
+			cfg: configapi.Configuration{
+				ClientConnection: &configapi.ClientConnection{
+					QPS:   ptr.To[float32](200),
+					Burst: ptr.To[int32](400),
+				},
+			},
+			wantQPS:   200,
+			wantBurst: 400,
+		},
+		"only QPS set preserves existing burst": {
+			cfg: configapi.Configuration{
+				ClientConnection: &configapi.ClientConnection{
+					QPS: ptr.To[float32](75),
+				},
+			},
+			initialBurst: 10,
+			wantQPS:      75,
+			wantBurst:    10,
+		},
+		"only burst set preserves existing QPS": {
+			cfg: configapi.Configuration{
+				ClientConnection: &configapi.ClientConnection{
+					Burst: ptr.To[int32](150),
+				},
+			},
+			initialQPS: 5,
+			wantQPS:    5,
+			wantBurst:  150,
+		},
+		"zero QPS is valid and applied": {
+			cfg: configapi.Configuration{
+				ClientConnection: &configapi.ClientConnection{
+					QPS:   ptr.To[float32](0),
+					Burst: ptr.To[int32](0),
+				},
+			},
+			initialQPS:   5,
+			initialBurst: 10,
+			wantQPS:      0,
+			wantBurst:    0,
+		},
+		"empty ClientConnection struct preserves existing values": {
+			cfg: configapi.Configuration{
+				ClientConnection: &configapi.ClientConnection{},
+			},
+			initialQPS:   5,
+			initialBurst: 10,
+			wantQPS:      5,
+			wantBurst:    10,
+		},
+	}
+
+	for name, tc := range testcases {
+		t.Run(name, func(t *testing.T) {
+			restCfg := &rest.Config{
+				QPS:   tc.initialQPS,
+				Burst: tc.initialBurst,
+			}
+			ApplyClientConnection(restCfg, &tc.cfg)
+			if restCfg.QPS != tc.wantQPS {
+				t.Errorf("QPS = %v, want %v", restCfg.QPS, tc.wantQPS)
+			}
+			if restCfg.Burst != tc.wantBurst {
+				t.Errorf("Burst = %v, want %v", restCfg.Burst, tc.wantBurst)
+			}
+		})
+	}
+}
+
+func TestLoadTLS(t *testing.T) {
 	testScheme := runtime.NewScheme()
 	if err := configapi.AddToScheme(testScheme); err != nil {
 		t.Fatal(err)
 	}
 
-	testcases := []struct {
-		name        string
-		enableHTTP2 bool
-		wantTLSOpts bool
+	tmpDir := t.TempDir()
+
+	writeConfig := func(name, tlsSection string) string {
+		path := filepath.Join(tmpDir, name)
+		content := `
+apiVersion: config.trainer.kubeflow.org/v1alpha1
+kind: Configuration
+` + tlsSection
+		if err := os.WriteFile(path, []byte(content), os.FileMode(0600)); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	http2Config := writeConfig("http2.yaml", `
+tls:
+  nextProtos: ["h2", "http/1.1"]
+`)
+	minVersionConfig := writeConfig("min-version.yaml", `
+tls:
+  minVersion: "1.3"
+`)
+	cipherSuitesConfig := writeConfig("cipher-suites.yaml", `
+tls:
+  cipherSuites:
+    - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+`)
+	curvePreferencesConfig := writeConfig("curve-preferences.yaml", `
+tls:
+  curvePreferences: [29, 23]
+`)
+	unknownConfig := writeConfig("unknown.yaml", `
+tls:
+  minVersion: "1.3"
+  cipherSuites: ["TLS_NOT_A_REAL_SUITE"]
+`)
+	unknownCurveConfig := writeConfig("unknown-curve.yaml", `
+tls:
+  curvePreferences: [9999]
+`)
+
+	testcases := map[string]struct {
+		configFile       string
+		wantNextProtos   []string
+		wantMinVersion   uint16
+		wantCipherSuites []uint16
+		wantCurvePrefs   []tls.CurveID
+		wantLoadErr      bool
+		wantLoadErrText  string
 	}{
-		{
-			name:        "HTTP/2 disabled sets TLSOpts",
-			enableHTTP2: false,
-			wantTLSOpts: true,
+		"HTTP/2 is disabled by default": {
+			configFile:     "",
+			wantNextProtos: []string{"http/1.1"},
 		},
-		{
-			name:        "HTTP/2 enabled does not set TLSOpts",
-			enableHTTP2: true,
-			wantTLSOpts: false,
+		"nextProtos enables HTTP/2": {
+			configFile:     http2Config,
+			wantNextProtos: []string{"h2", "http/1.1"},
+		},
+		"minVersion is applied and HTTP/2 stays disabled": {
+			configFile:     minVersionConfig,
+			wantNextProtos: []string{"http/1.1"},
+			wantMinVersion: tls.VersionTLS13,
+		},
+		"cipherSuites are resolved to their IDs": {
+			configFile:     cipherSuitesConfig,
+			wantNextProtos: []string{"http/1.1"},
+			wantCipherSuites: []uint16{
+				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			},
+		},
+		"curvePreferences are resolved to their IDs": {
+			configFile:     curvePreferencesConfig,
+			wantNextProtos: []string{"http/1.1"},
+			wantCurvePrefs: []tls.CurveID{tls.X25519, tls.CurveP256},
+		},
+		"unrecognized cipher suite fails configuration loading": {
+			configFile:      unknownConfig,
+			wantLoadErr:     true,
+			wantLoadErrText: "tls.cipherSuites[0]",
+		},
+		"unsupported curve ID fails configuration loading": {
+			configFile:      unknownCurveConfig,
+			wantLoadErr:     true,
+			wantLoadErrText: "tls.curvePreferences",
 		},
 	}
 
-	for _, tc := range testcases {
-		t.Run(tc.name, func(t *testing.T) {
-			options, _, err := Load(testScheme, "", tc.enableHTTP2)
+	for name, tc := range testcases {
+		t.Run(name, func(t *testing.T) {
+			options, _, err := Load(testScheme, tc.configFile)
+			if tc.wantLoadErr {
+				if err == nil {
+					t.Fatal("Expected load error, got nil")
+				}
+				if tc.wantLoadErrText != "" && !strings.Contains(err.Error(), tc.wantLoadErrText) {
+					t.Errorf("Load() error %q does not contain %q", err, tc.wantLoadErrText)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("Unexpected error: %v", err)
 			}
-			if tc.wantTLSOpts && len(options.Metrics.TLSOpts) == 0 {
-				t.Error("Expected TLSOpts to be set for disabling HTTP/2")
+
+			// TLS options from the config file are applied to the webhook server.
+			// The metrics server receives its TLS config via tlsconfig.Apply inside
+			// SetupServer, called after certs are guaranteed present.
+			webhookSrv, ok := options.WebhookServer.(*webhook.DefaultServer)
+			if !ok {
+				t.Fatal("Expected WebhookServer to be a *webhook.DefaultServer")
 			}
-			if !tc.wantTLSOpts && len(options.Metrics.TLSOpts) > 0 {
-				t.Error("Expected TLSOpts to be empty when HTTP/2 is enabled")
+			if len(webhookSrv.Options.TLSOpts) == 0 {
+				t.Fatal("Expected TLSOpts to be set on the webhook server")
+			}
+
+			got := &tls.Config{}
+			for _, apply := range webhookSrv.Options.TLSOpts {
+				apply(got)
+			}
+
+			if diff := cmp.Diff(tc.wantNextProtos, got.NextProtos); len(diff) != 0 {
+				t.Errorf("Unexpected NextProtos (-want,+got):\n%s", diff)
+			}
+			if got.MinVersion != tc.wantMinVersion {
+				t.Errorf("MinVersion = %v, want %v", got.MinVersion, tc.wantMinVersion)
+			}
+			if diff := cmp.Diff(tc.wantCipherSuites, got.CipherSuites, cmpopts.EquateEmpty()); len(diff) != 0 {
+				t.Errorf("Unexpected CipherSuites (-want,+got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tc.wantCurvePrefs, got.CurvePreferences, cmpopts.EquateEmpty()); len(diff) != 0 {
+				t.Errorf("Unexpected CurvePreferences (-want,+got):\n%s", diff)
 			}
 		})
 	}

@@ -27,6 +27,7 @@ import (
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	"go.uber.org/zap/zapcore"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
@@ -44,13 +45,15 @@ import (
 
 	trainer "github.com/kubeflow/trainer/v2/pkg/apis/trainer/v1alpha1"
 	"github.com/kubeflow/trainer/v2/pkg/controller"
+	"github.com/kubeflow/trainer/v2/pkg/features"
 	runtimecore "github.com/kubeflow/trainer/v2/pkg/runtime/core"
 	kubeflowwebhooks "github.com/kubeflow/trainer/v2/pkg/webhooks"
 )
 
 type Framework struct {
-	testEnv *envtest.Environment
-	cancel  context.CancelFunc
+	testEnv          *envtest.Environment
+	cancel           context.CancelFunc
+	SuggestionClient controller.SearchAlgorithmClient
 }
 
 func (f *Framework) Init() *rest.Config {
@@ -68,6 +71,10 @@ func (f *Framework) Init() *rest.Config {
 		},
 		ErrorIfCRDPathMissing: true,
 	}
+	// Serve the Workload and PodGroup APIs for Workload-Aware Scheduling, as in hack/kind-config-was.yaml.
+	f.testEnv.ControlPlane.GetAPIServer().Configure().
+		Set("runtime-config", "scheduling.k8s.io/v1beta1=true").
+		Set("feature-gates", "GenericWorkload=true,TopologyAwareWorkloadScheduling=true,DRAWorkloadResourceClaims=true")
 	cfg, err := f.testEnv.Start()
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 	gomega.Expect(cfg).NotTo(gomega.BeNil())
@@ -101,9 +108,25 @@ func (f *Framework) RunManager(cfg *rest.Config, startControllers bool) (context
 	})
 	gomega.ExpectWithOffset(1, err).NotTo(gomega.HaveOccurred(), "failed to create manager")
 
+	// Alpha feature gates exercised by the integration suites. TrainJobStatus is disabled while
+	// the runtimes are built, so the trainjobstatus plugin, which requires the status server
+	// configuration, is not registered.
+	gomega.ExpectWithOffset(1, utilfeature.DefaultMutableFeatureGate.SetFromMap(map[string]bool{
+		string(features.TrainJobDynamicResourceAllocation): true,
+		string(features.TrainJobStatus):                    false,
+		string(features.OptimizationJob):                   false,
+		string(features.TrainJobWorkloadAwareScheduling):   true,
+	})).To(gomega.Succeed())
+
 	runtimes, err := runtimecore.New(ctx, mgr.GetClient(), mgr.GetFieldIndexer(), nil)
 	gomega.ExpectWithOffset(1, err).NotTo(gomega.HaveOccurred())
 	gomega.ExpectWithOffset(1, runtimes).NotTo(gomega.BeNil())
+
+	// OptimizationJob depends on TrainJobStatus.
+	gomega.ExpectWithOffset(1, utilfeature.DefaultMutableFeatureGate.SetFromMap(map[string]bool{
+		string(features.TrainJobStatus):  true,
+		string(features.OptimizationJob): true,
+	})).To(gomega.Succeed())
 
 	if startControllers {
 		failedCtrlName, err := controller.SetupControllers(mgr, runtimes, ctrlpkg.Options{
@@ -114,7 +137,7 @@ func (f *Framework) RunManager(cfg *rest.Config, startControllers bool) (context
 			// https://github.com/kubernetes-sigs/controller-runtime/pull/2902#issuecomment-2284194683
 			// https://github.com/kubernetes-sigs/controller-runtime/issues/2994
 			SkipNameValidation: ptr.To(true),
-		})
+		}, f.SuggestionClient)
 		gomega.ExpectWithOffset(1, err).NotTo(gomega.HaveOccurred(), "controller", failedCtrlName)
 		gomega.ExpectWithOffset(1, failedCtrlName).To(gomega.BeEmpty())
 	}

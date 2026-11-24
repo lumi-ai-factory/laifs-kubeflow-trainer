@@ -1,3 +1,17 @@
+# Copyright The Kubeflow Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # coding: utf-8
 
 """
@@ -30,7 +44,7 @@ class IoK8sApiAutoscalingV2ObjectMetricStatus(BaseModel):
     ObjectMetricStatus indicates the current value of a metric describing a kubernetes object (for example, hits-per-second on an Ingress object).
     """ # noqa: E501
     current: IoK8sApiAutoscalingV2MetricValueStatus = Field(description="current contains the current value for the given metric")
-    described_object: IoK8sApiAutoscalingV2CrossVersionObjectReference = Field(description="DescribedObject specifies the descriptions of a object,such as kind,name apiVersion", alias="describedObject")
+    described_object: IoK8sApiAutoscalingV2CrossVersionObjectReference = Field(description="describedObject specifies the descriptions of a object,such as kind,name apiVersion", alias="describedObject")
     metric: IoK8sApiAutoscalingV2MetricIdentifier = Field(description="metric identifies the target metric by name and selector")
     __properties: ClassVar[List[str]] = ["current", "describedObject", "metric"]
 

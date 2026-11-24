@@ -20,8 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"iter"
-	"slices"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -31,6 +29,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/clock"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -49,44 +48,30 @@ import (
 	"github.com/kubeflow/trainer/v2/pkg/util/trainjob"
 )
 
-type TrainJobWatcher interface {
-	NotifyTrainJobUpdate(oldJob, newJob *trainer.TrainJob)
-}
-
 type TrainJobReconciler struct {
 	log      logr.Logger
 	client   client.Client
 	recorder events.EventRecorder
 	runtimes map[string]jobruntimes.Runtime
-	watchers iter.Seq[TrainJobWatcher]
-}
-
-type TrainJobReconcilerOptions struct {
-	Watchers iter.Seq[TrainJobWatcher]
-}
-
-type TrainJobReconcilerOption func(*TrainJobReconcilerOptions)
-
-func WithWatchers(watchers ...TrainJobWatcher) TrainJobReconcilerOption {
-	return func(o *TrainJobReconcilerOptions) {
-		o.Watchers = slices.Values(watchers)
-	}
+	// clock is the time source for the activeDeadlineSeconds arithmetic. Tests
+	// substitute a fake clock so the requeue delay can be asserted exactly.
+	clock clock.PassiveClock
 }
 
 var _ reconcile.Reconciler = (*TrainJobReconciler)(nil)
 var _ predicate.TypedPredicate[*trainer.TrainJob] = (*TrainJobReconciler)(nil)
 
-func NewTrainJobReconciler(client client.Client, recorder events.EventRecorder, runtimes map[string]jobruntimes.Runtime, opts ...TrainJobReconcilerOption) *TrainJobReconciler {
-	options := &TrainJobReconcilerOptions{}
-	for _, opt := range opts {
-		opt(options)
-	}
+func NewTrainJobReconciler(
+	client client.Client,
+	recorder events.EventRecorder,
+	runtimes map[string]jobruntimes.Runtime,
+) *TrainJobReconciler {
 	return &TrainJobReconciler{
 		log:      ctrl.Log.WithName("trainjob-controller"),
 		client:   client,
 		recorder: recorder,
 		runtimes: runtimes,
-		watchers: options.Watchers,
+		clock:    clock.RealClock{},
 	}
 }
 
@@ -106,20 +91,21 @@ func (r *TrainJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	ctx = ctrl.LoggerInto(ctx, log)
 	log.V(2).Info("Reconciling TrainJob")
 
+	if trainjob.IsManagedByExternalController(&trainJob) {
+		log.V(2).Info("Skipping TrainJob managed by a custom controller", "managedBy", ptr.Deref(trainJob.Spec.ManagedBy, ""))
+		return ctrl.Result{}, nil
+	}
+
 	var err error
 	// Keep track of the origin TrainJob status
 	prevTrainJob := trainJob.DeepCopy()
-
-	// Let's clear the failed condition that could have been set previously.
-	// An external change to the TrainJob spec may transition it out of the Failed state.
-	removeFailedCondition(&trainJob)
 
 	runtimeRefGK := jobruntimes.RuntimeRefToRuntimeRegistryKey(trainJob.Spec.RuntimeRef)
 	runtime, ok := r.runtimes[runtimeRefGK]
 	if !ok {
 		err = fmt.Errorf("unsupported runtime: %s", runtimeRefGK)
 		setFailedCondition(&trainJob, fmt.Sprintf("unsupported runtime: %s", runtimeRefGK), trainer.TrainJobRuntimeNotSupportedReason)
-	} else if !trainjob.IsTrainJobFinished(&trainJob) {
+	} else {
 		err = r.reconcileObjects(ctx, runtime, &trainJob)
 		if err != nil {
 			// TODO (astefanutti): the error should be surfaced in the TrainJob status to indicate
@@ -132,45 +118,60 @@ func (r *TrainJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			}
 			r.recorder.Eventf(&trainJob, nil, corev1.EventTypeWarning, "TrainJobResourcesCreationFailed", "Reconciling", message)
 		}
+		if statusErr := setTrainJobStatus(ctx, runtime, &trainJob); statusErr != nil {
+			err = errors.Join(err, statusErr)
+		}
 	}
 
 	setSuspendedCondition(&trainJob)
 
-	if statusErr := setTrainJobStatus(ctx, runtime, &trainJob); statusErr != nil {
-		err = errors.Join(err, statusErr)
-	}
+	deadlineResult := r.reconcileDeadline(ctx, &trainJob)
 
-	if deadlineResult, deadlineErr := r.reconcileDeadline(ctx, &trainJob); deadlineErr != nil || deadlineResult.RequeueAfter > 0 {
-		if !equality.Semantic.DeepEqual(&trainJob.Status, &prevTrainJob.Status) {
-			return deadlineResult, errors.Join(err, r.client.Status().Patch(ctx, &trainJob, client.MergeFrom(prevTrainJob)))
-		}
-		return deadlineResult, errors.Join(err, deadlineErr)
-	}
-
-	if !equality.Semantic.DeepEqual(&trainJob.Status, prevTrainJob.Status) {
+	if !equality.Semantic.DeepEqual(trainJob.Status, prevTrainJob.Status) {
 		// TODO(astefanutti): Consider using SSA once controller-runtime client has SSA support
 		// for sub-resources. See: https://github.com/kubernetes-sigs/controller-runtime/issues/3183
-		return ctrl.Result{}, errors.Join(err, r.client.Status().Patch(ctx, &trainJob, client.MergeFrom(prevTrainJob)))
+		err = errors.Join(err, r.client.Status().Patch(ctx, &trainJob, client.MergeFrom(prevTrainJob)))
+	}
+
+	if deadlineResult.RequeueAfter > 0 {
+		return deadlineResult, err
 	}
 	return ctrl.Result{}, err
 }
 
 func (r *TrainJobReconciler) reconcileObjects(ctx context.Context, runtime jobruntimes.Runtime, trainJob *trainer.TrainJob) error {
-	objects, err := runtime.NewObjects(ctx, trainJob)
-	if err != nil {
-		return err
-	}
-	for _, object := range objects {
-		if err := r.client.Apply(ctx, object, client.FieldOwner("trainer"), client.ForceOwnership); err != nil {
-			return err
+	var applyErr error
+	if !trainjob.IsTrainJobFinished(trainJob) {
+		objects, err := runtime.NewObjects(ctx, trainJob)
+		if err != nil {
+			applyErr = err
+		}
+		for _, object := range objects {
+			if err := r.client.Apply(ctx, object, client.FieldOwner("trainer"), client.ForceOwnership); err != nil {
+				applyErr = err
+				break
+			}
 		}
 	}
-	return nil
+
+	// Runs even for finished TrainJobs, so plugins can clean up objects of finished or
+	// suspended TrainJobs (e.g. a gang-scheduling PodGroup, which would otherwise keep
+	// reserving scheduler queue capacity indefinitely).
+	toDelete, err := runtime.DeleteObjects(ctx, trainJob)
+	if err != nil {
+		return errors.Join(applyErr, fmt.Errorf("resolving objects to delete: %w", err))
+	}
+	for _, object := range toDelete {
+		if err := client.IgnoreNotFound(r.client.Delete(ctx, object)); err != nil {
+			return errors.Join(applyErr, fmt.Errorf("deleting %s: %w", klog.KObj(object), err))
+		}
+	}
+	return applyErr
 }
 
-func (r *TrainJobReconciler) reconcileDeadline(ctx context.Context, trainJob *trainer.TrainJob) (ctrl.Result, error) {
+func (r *TrainJobReconciler) reconcileDeadline(ctx context.Context, trainJob *trainer.TrainJob) ctrl.Result {
 	if trainJob.Spec.ActiveDeadlineSeconds == 0 || trainjob.IsTrainJobFinished(trainJob) || ptr.Deref(trainJob.Spec.Suspend, false) {
-		return ctrl.Result{}, nil
+		return ctrl.Result{}
 	}
 	startTime := trainJob.CreationTimestamp.Time
 	suspendedCond := meta.FindStatusCondition(trainJob.Status.Conditions, trainer.TrainJobSuspended)
@@ -178,61 +179,55 @@ func (r *TrainJobReconciler) reconcileDeadline(ctx context.Context, trainJob *tr
 		startTime = suspendedCond.LastTransitionTime.Time
 	}
 	if startTime.IsZero() {
-		return ctrl.Result{}, nil
+		return ctrl.Result{}
 	}
 	deadline := startTime.Add(time.Duration(trainJob.Spec.ActiveDeadlineSeconds) * time.Second)
-	now := time.Now()
+	now := r.clock.Now()
 	if now.After(deadline) {
 		ctrl.LoggerFrom(ctx).V(2).Info("TrainJob deadline exceeded, marking as failed",
 			"activeDeadlineSeconds", trainJob.Spec.ActiveDeadlineSeconds,
 			"startTime", startTime,
 			"deadline", deadline)
 		setFailedCondition(trainJob, constants.TrainJobDeadlineExceededMessage, trainer.TrainJobDeadlineExceededReason)
+		// TODO(#3833): a failed JobSet delete is only logged here and never retried, since the
+		// TrainJob is already Failed on the next reconcile. Moving this deletion to a JobSet
+		// ComponentDeleterPlugin would let reconcileObjects retry it.
 		jobSet := &jobsetv1alpha2.JobSet{
 			ObjectMeta: metav1.ObjectMeta{Name: trainJob.Name, Namespace: trainJob.Namespace},
 		}
 		if err := client.IgnoreNotFound(r.client.Delete(ctx, jobSet)); err != nil {
 			ctrl.LoggerFrom(ctx).V(2).Info("Failed to delete JobSet after deadline exceeded", "error", err)
 		}
-		return ctrl.Result{}, nil
+		return ctrl.Result{}
 	}
-	requeueAfter := time.Until(deadline)
+	requeueAfter := deadline.Sub(now)
 	if requeueAfter <= 0 {
 		requeueAfter = 1 * time.Second
 	}
 	ctrl.LoggerFrom(ctx).V(2).Info("Scheduling deadline check",
 		"activeDeadlineSeconds", trainJob.Spec.ActiveDeadlineSeconds,
 		"requeueAfter", requeueAfter)
-	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+	return ctrl.Result{RequeueAfter: requeueAfter}
 }
 
 func (r *TrainJobReconciler) Create(e event.TypedCreateEvent[*trainer.TrainJob]) bool {
 	r.log.WithValues("trainJob", klog.KObj(e.Object)).Info("TrainJob create event")
-	defer r.notifyWatchers(nil, e.Object)
 	return true
 }
 
 func (r *TrainJobReconciler) Delete(e event.TypedDeleteEvent[*trainer.TrainJob]) bool {
 	r.log.WithValues("trainJob", klog.KObj(e.Object)).Info("TrainJob delete event")
-	defer r.notifyWatchers(e.Object, nil)
 	return true
 }
 
 func (r *TrainJobReconciler) Update(e event.TypedUpdateEvent[*trainer.TrainJob]) bool {
 	r.log.WithValues("trainJob", klog.KObj(e.ObjectNew)).Info("TrainJob update event")
-	defer r.notifyWatchers(e.ObjectOld, e.ObjectNew)
 	return true
 }
 
 func (r *TrainJobReconciler) Generic(e event.TypedGenericEvent[*trainer.TrainJob]) bool {
 	r.log.WithValues("trainJob", klog.KObj(e.Object)).Info("TrainJob generic event")
 	return true
-}
-
-func (r *TrainJobReconciler) notifyWatchers(oldJob, newJob *trainer.TrainJob) {
-	for w := range r.watchers {
-		w.NotifyTrainJobUpdate(oldJob, newJob)
-	}
 }
 
 func setSuspendedCondition(trainJob *trainer.TrainJob) {
@@ -266,14 +261,6 @@ func setFailedCondition(trainJob *trainer.TrainJob, message, reason string) {
 		Reason:  reason,
 	}
 	meta.SetStatusCondition(&trainJob.Status.Conditions, newCond)
-}
-
-func removeFailedCondition(trainJob *trainer.TrainJob) {
-	cond := meta.FindStatusCondition(trainJob.Status.Conditions, trainer.TrainJobFailed)
-	if cond != nil && cond.Reason == trainer.TrainJobDeadlineExceededReason {
-		return
-	}
-	meta.RemoveStatusCondition(&trainJob.Status.Conditions, trainer.TrainJobFailed)
 }
 
 func setTrainJobStatus(ctx context.Context, runtime jobruntimes.Runtime, trainJob *trainer.TrainJob) error {

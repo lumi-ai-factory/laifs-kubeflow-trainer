@@ -1,3 +1,17 @@
+# Copyright The Kubeflow Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 suite: test manager configmap
 templates:
   - manager/configmap.yaml
@@ -28,29 +42,29 @@ tests:
           path: data["controller_manager_config.yaml"]
           pattern: "port: 9443"
 
-  - it: should use custom webhook service and secret names from config
+  - it: should use custom service and secret names from config
     set:
       manager:
         config:
           certManagement:
-            webhookServiceName: "custom-webhook-service"
-            webhookSecretName: "custom-webhook-secret"
+            serviceName: "custom-webhook-service"
+            secretName: "custom-webhook-secret"
     asserts:
       - matchRegex:
           path: data["controller_manager_config.yaml"]
-          pattern: "webhookServiceName: custom-webhook-service"
+          pattern: "serviceName: custom-webhook-service"
       - matchRegex:
           path: data["controller_manager_config.yaml"]
-          pattern: "webhookSecretName: custom-webhook-secret"
+          pattern: "secretName: custom-webhook-secret"
 
-  - it: should auto-generate webhook service and secret names when not provided
+  - it: should auto-generate service and secret names when not provided
     asserts:
       - matchRegex:
           path: data["controller_manager_config.yaml"]
-          pattern: "webhookServiceName: kubeflow-trainer-controller-manager"
+          pattern: "serviceName: kubeflow-trainer-controller-manager"
       - matchRegex:
           path: data["controller_manager_config.yaml"]
-          pattern: "webhookSecretName: kubeflow-trainer-webhook-cert"
+          pattern: "secretName: kubeflow-trainer-webhook-cert"
 
   - it: should enable leader election by default
     asserts:
@@ -81,6 +95,47 @@ tests:
       - matchRegex:
           path: data["controller_manager_config.yaml"]
           pattern: "ClusterTrainingRuntime.trainer.kubeflow.org: 3"
+
+  - it: should render default clientConnection qps and burst
+    asserts:
+      - matchRegex:
+          path: data["controller_manager_config.yaml"]
+          pattern: "clientConnection:"
+      - matchRegex:
+          path: data["controller_manager_config.yaml"]
+          pattern: "qps: 50"
+      - matchRegex:
+          path: data["controller_manager_config.yaml"]
+          pattern: "burst: 100"
+
+  - it: should configure metrics authentication
+    set:
+      manager.config.metrics.auth.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["controller_manager_config.yaml"]
+          pattern: |
+            (?s)metrics:\s+bindAddress: :8443\s+secureServing: true\s+auth:\s+enabled: true
+
+  - it: should fail when authentication is enabled without secure serving
+    set:
+      manager.config.metrics.auth.enabled: true
+      manager.config.metrics.secureServing: false
+    asserts:
+      - failedTemplate:
+          errorMessage: "manager.config.metrics.auth.enabled requires manager.config.metrics.secureServing to be true"
+
+  - it: should render custom clientConnection qps and burst
+    set:
+      manager.config.clientConnection.qps: 200
+      manager.config.clientConnection.burst: 400
+    asserts:
+      - matchRegex:
+          path: data["controller_manager_config.yaml"]
+          pattern: "qps: 200"
+      - matchRegex:
+          path: data["controller_manager_config.yaml"]
+          pattern: "burst: 400"
 
   - it: should set feature gates
     set:

@@ -1,3 +1,17 @@
+# Copyright The Kubeflow Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # coding: utf-8
 
 """
@@ -31,7 +45,7 @@ class IoK8sApiAutoscalingV2MetricStatus(BaseModel):
     """
     MetricStatus describes the last-read state of a single metric.
     """ # noqa: E501
-    container_resource: Optional[IoK8sApiAutoscalingV2ContainerResourceMetricStatus] = Field(default=None, description="container resource refers to a resource metric (such as those specified in requests and limits) known to Kubernetes describing a single container in each pod in the current scale target (e.g. CPU or memory). Such metrics are built in to Kubernetes, and have special scaling options on top of those available to normal per-pod metrics using the \"pods\" source.", alias="containerResource")
+    container_resource: Optional[IoK8sApiAutoscalingV2ContainerResourceMetricStatus] = Field(default=None, description="containerResource refers to a resource metric (such as those specified in requests and limits) known to Kubernetes describing a single container in each pod in the current scale target (e.g. CPU or memory). Such metrics are built in to Kubernetes, and have special scaling options on top of those available to normal per-pod metrics using the \"pods\" source.", alias="containerResource")
     external: Optional[IoK8sApiAutoscalingV2ExternalMetricStatus] = Field(default=None, description="external refers to a global metric that is not associated with any Kubernetes object. It allows autoscaling based on information coming from components running outside of cluster (for example length of queue in cloud messaging service, or QPS from loadbalancer running outside of cluster).")
     object: Optional[IoK8sApiAutoscalingV2ObjectMetricStatus] = Field(default=None, description="object refers to a metric describing a single kubernetes object (for example, hits-per-second on an Ingress object).")
     pods: Optional[IoK8sApiAutoscalingV2PodsMetricStatus] = Field(default=None, description="pods refers to a metric describing each pod in the current scale target (for example, transactions-processed-per-second).  The values will be averaged together before being compared to the target value.")

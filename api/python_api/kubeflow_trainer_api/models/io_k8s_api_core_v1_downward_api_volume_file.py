@@ -1,3 +1,17 @@
+# Copyright The Kubeflow Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # coding: utf-8
 
 """
@@ -32,7 +46,8 @@ class IoK8sApiCoreV1DownwardAPIVolumeFile(BaseModel):
     mode: Optional[StrictInt] = Field(default=None, description="Optional: mode bits used to set permissions on this file, must be an octal value between 0000 and 0777 or a decimal value between 0 and 511. YAML accepts both octal and decimal values, JSON requires decimal values for mode bits. If not specified, the volume defaultMode will be used. This might be in conflict with other options that affect the file mode, like fsGroup, and the result can be other mode bits set.")
     path: StrictStr = Field(description="Required: Path is  the relative path name of the file to be created. Must not be absolute or contain the '..' path. Must be utf-8 encoded. The first item of the relative path must not start with '..'")
     resource_field_ref: Optional[IoK8sApiCoreV1ResourceFieldSelector] = Field(default=None, description="Selects a resource of the container: only resources limits and requests (limits.cpu, limits.memory, requests.cpu and requests.memory) are currently supported.", alias="resourceFieldRef")
-    __properties: ClassVar[List[str]] = ["fieldRef", "mode", "path", "resourceFieldRef"]
+    user: Optional[StrictInt] = Field(default=None, description="user is Optional: The owner UID of the created file. If specified, the item-level user field takes precedence over defaultUser. (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.")
+    __properties: ClassVar[List[str]] = ["fieldRef", "mode", "path", "resourceFieldRef", "user"]
 
     model_config = ConfigDict(
         populate_by_name=True,
@@ -94,7 +109,8 @@ class IoK8sApiCoreV1DownwardAPIVolumeFile(BaseModel):
             "fieldRef": IoK8sApiCoreV1ObjectFieldSelector.from_dict(obj["fieldRef"]) if obj.get("fieldRef") is not None else None,
             "mode": obj.get("mode"),
             "path": obj.get("path") if obj.get("path") is not None else '',
-            "resourceFieldRef": IoK8sApiCoreV1ResourceFieldSelector.from_dict(obj["resourceFieldRef"]) if obj.get("resourceFieldRef") is not None else None
+            "resourceFieldRef": IoK8sApiCoreV1ResourceFieldSelector.from_dict(obj["resourceFieldRef"]) if obj.get("resourceFieldRef") is not None else None,
+            "user": obj.get("user")
         })
         return _obj
 

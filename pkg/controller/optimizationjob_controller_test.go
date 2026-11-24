@@ -1,0 +1,2525 @@
+/*
+Copyright The Kubeflow Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	katibapi "github.com/kubeflow/katib/pkg/apis/manager/v1beta1"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/tools/events"
+	"k8s.io/klog/v2/ktesting"
+	clocktesting "k8s.io/utils/clock/testing"
+	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	trainer "github.com/kubeflow/trainer/v2/pkg/apis/trainer/v1alpha1"
+	"github.com/kubeflow/trainer/v2/pkg/constants"
+	optimizationjob "github.com/kubeflow/trainer/v2/pkg/util/optimizationjob"
+	utiltesting "github.com/kubeflow/trainer/v2/pkg/util/testing"
+)
+
+type mockFailingClient struct {
+	client.Client
+	failPatchDeploy    bool
+	failCreateTrainJob bool
+}
+
+func (m *mockFailingClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	if m.failCreateTrainJob {
+		if _, ok := obj.(*trainer.TrainJob); ok {
+			return fmt.Errorf("mock trainjob creation failed")
+		}
+	}
+	return m.Client.Create(ctx, obj, opts...)
+}
+
+func (m *mockFailingClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	if m.failPatchDeploy {
+		if _, ok := obj.(*appsv1.Deployment); ok {
+			return fmt.Errorf("mock deployment creation failed")
+		}
+	}
+	return m.Client.Patch(ctx, obj, patch, opts...)
+}
+
+type mockSearchAlgorithmClient struct {
+	mockedAssignments [][]trainer.ParameterAssignment
+	err               error
+
+	lastAddr string
+	lastReq  *katibapi.GetSuggestionsRequest
+	calls    int
+}
+
+func (m *mockSearchAlgorithmClient) GetSuggestions(
+	ctx context.Context,
+	addr string,
+	req *katibapi.GetSuggestionsRequest,
+) ([][]trainer.ParameterAssignment, error) {
+	m.calls++
+	m.lastAddr = addr
+	m.lastReq = req
+
+	return m.mockedAssignments, m.err
+}
+
+func getBaseOptJob() *trainer.OptimizationJob {
+	return &trainer.OptimizationJob{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: trainer.GroupVersion.String(),
+			Kind:       "OptimizationJob",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-optjob",
+			Namespace: metav1.NamespaceDefault,
+			UID:       "test-uid-123",
+		},
+		Spec: trainer.OptimizationJobSpec{
+			NumTrials:      2,
+			ParallelTrials: 1,
+			SearchAlgorithm: &trainer.SearchAlgorithm{
+				Random: &trainer.RandomAlgorithm{},
+			},
+			Objectives: []trainer.Objective{
+				{Metric: "accuracy", Direction: trainer.ObjectiveDirectionMaximize},
+			},
+			TrainJobTemplate: trainer.TrainJobTemplateSpec{
+				Spec: trainer.TrainJobSpec{
+					Trainer: &trainer.Trainer{},
+				},
+			},
+		},
+	}
+}
+
+func TestBuildSuggestionRequest_SearchSpaceMapping(t *testing.T) {
+	tests := []struct {
+		name        string
+		searchSpace trainer.SearchSpace
+		wantType    katibapi.ParameterType
+		wantMin     string
+		wantMax     string
+		wantList    []string
+	}{
+		{
+			name: "uniform float",
+			searchSpace: trainer.SearchSpace{
+				Uniform: trainer.UniformSpace{
+					Min:  "0.01",
+					Max:  "0.10",
+					Type: trainer.ParameterTypeFloat,
+				},
+			},
+			wantType: katibapi.ParameterType_DOUBLE,
+			wantMin:  "0.01",
+			wantMax:  "0.10",
+		},
+		{
+			name: "uniform int",
+			searchSpace: trainer.SearchSpace{
+				Uniform: trainer.UniformSpace{
+					Min:  "1",
+					Max:  "10",
+					Type: trainer.ParameterTypeInt,
+				},
+			},
+			wantType: katibapi.ParameterType_INT,
+			wantMin:  "1",
+			wantMax:  "10",
+		},
+		{
+			name: "log uniform float",
+			searchSpace: trainer.SearchSpace{
+				LogUniform: trainer.LogUniformSpace{
+					Min:  "0.001",
+					Max:  "1.0",
+					Type: trainer.ParameterTypeFloat,
+				},
+			},
+			wantType: katibapi.ParameterType_DOUBLE,
+			wantMin:  "0.001",
+			wantMax:  "1.0",
+		},
+		{
+			name: "log uniform int",
+			searchSpace: trainer.SearchSpace{
+				LogUniform: trainer.LogUniformSpace{
+					Min:  "1",
+					Max:  "100",
+					Type: trainer.ParameterTypeInt,
+				},
+			},
+			wantType: katibapi.ParameterType_INT,
+			wantMin:  "1",
+			wantMax:  "100",
+		},
+		{
+			name: "categorical",
+			searchSpace: trainer.SearchSpace{
+				Categorical: trainer.CategoricalSpace{
+					Choices: []string{"adam", "sgd", "rmsprop"},
+				},
+			},
+			wantType: katibapi.ParameterType_CATEGORICAL,
+			wantList: []string{"adam", "sgd", "rmsprop"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			optJob := getBaseOptJob()
+
+			optJob.Spec.Parameters = []trainer.Parameter{
+				{
+					Name:        "test-param",
+					SearchSpace: &tt.searchSpace,
+				},
+			}
+
+			req, err := optimizationjob.BuildSuggestionRequest(optJob, nil, 1)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if req == nil {
+				t.Fatal("expected non-nil GetSuggestionsRequest")
+			}
+
+			if req.Experiment == nil || req.Experiment.Spec == nil {
+				t.Fatal("expected Experiment and Experiment.Spec to be populated")
+			}
+
+			if req.Experiment.Spec.ParameterSpecs == nil {
+				t.Fatal("expected ParameterSpecs to be populated")
+			}
+
+			params := req.Experiment.Spec.ParameterSpecs.Parameters
+
+			if len(params) != 1 {
+				t.Fatalf("expected 1 parameter, got %d", len(params))
+			}
+
+			param := params[0]
+
+			if param.Name != "test-param" {
+				t.Errorf(
+					"expected parameter name %q, got %q",
+					"test-param",
+					param.Name,
+				)
+			}
+
+			if param.ParameterType != tt.wantType {
+				t.Errorf(
+					"expected parameter type %v, got %v",
+					tt.wantType,
+					param.ParameterType,
+				)
+			}
+
+			if param.FeasibleSpace == nil {
+				t.Fatal("expected FeasibleSpace to be populated")
+			}
+
+			if tt.wantList != nil {
+				if diff := cmp.Diff(tt.wantList, param.FeasibleSpace.List); diff != "" {
+					t.Errorf("unexpected categorical choices (-want +got):\n%s", diff)
+				}
+				return
+			}
+
+			if param.FeasibleSpace.Min != tt.wantMin {
+				t.Errorf(
+					"expected min %q, got %q",
+					tt.wantMin,
+					param.FeasibleSpace.Min,
+				)
+			}
+
+			if param.FeasibleSpace.Max != tt.wantMax {
+				t.Errorf(
+					"expected max %q, got %q",
+					tt.wantMax,
+					param.FeasibleSpace.Max,
+				)
+			}
+		})
+	}
+}
+
+func TestBuildSuggestionRequest_UnsupportedAlgorithm(t *testing.T) {
+	optJob := getBaseOptJob()
+	optJob.Spec.SearchAlgorithm = &trainer.SearchAlgorithm{
+		Grid: &trainer.GridAlgorithm{},
+	}
+
+	_, err := optimizationjob.BuildSuggestionRequest(optJob, nil, 1)
+	if err == nil {
+		t.Fatal("expected error for unsupported algorithm 'grid', got nil")
+	}
+}
+
+func TestBuildSuggestionRequest_ReconstructsTrialHistory(t *testing.T) {
+	optJob := getBaseOptJob()
+
+	optJob.Spec.Parameters = []trainer.Parameter{
+		{
+			Name: "lr",
+			SearchSpace: &trainer.SearchSpace{
+				Uniform: trainer.UniformSpace{
+					Min:  "0.01",
+					Max:  "0.1",
+					Type: trainer.ParameterTypeFloat,
+				},
+			},
+		},
+	}
+
+	trainJobs := []trainer.TrainJob{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "test-optjob-trial-0",
+			},
+			Spec: trainer.TrainJobSpec{
+				Trainer: &trainer.Trainer{
+					Env: []corev1.EnvVar{
+						{
+							Name:  constants.EnvVarPrefix + "lr",
+							Value: "0.03",
+						},
+					},
+				},
+			},
+			Status: trainer.TrainJobStatus{
+				Conditions: []metav1.Condition{
+					{
+						Type:   trainer.TrainJobComplete,
+						Status: metav1.ConditionTrue,
+					},
+				},
+				TrainerStatus: &trainer.TrainerStatus{
+					Metrics: []trainer.Metric{
+						{
+							Name:  "accuracy",
+							Value: "0.70",
+						},
+						{
+							Name:  "accuracy",
+							Value: "0.85", // final per-epoch value should be picked
+						},
+					},
+				},
+			},
+		},
+	}
+
+	req, err := optimizationjob.BuildSuggestionRequest(
+		optJob,
+		trainJobs,
+		1,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if req.TotalRequestNumber != 1 {
+		t.Fatalf(
+			"expected TotalRequestNumber=1, got %d",
+			req.TotalRequestNumber,
+		)
+	}
+
+	if len(req.Trials) != 1 {
+		t.Fatalf(
+			"expected 1 trial, got %d",
+			len(req.Trials),
+		)
+	}
+
+	trial := req.Trials[0]
+	if trial.Spec.GetObjective().GetObjectiveMetricName() != "accuracy" {
+		t.Errorf("expected trial objective metric accuracy, got %q", trial.Spec.GetObjective().GetObjectiveMetricName())
+	}
+
+	if trial.Name != "test-optjob-trial-0" {
+		t.Fatalf(
+			"expected trial name test-optjob-trial-0, got %q",
+			trial.Name,
+		)
+	}
+
+	assignments :=
+		trial.GetSpec().
+			GetParameterAssignments().
+			GetAssignments()
+
+	if len(assignments) != 1 {
+		t.Fatalf(
+			"expected 1 parameter assignment, got %d",
+			len(assignments),
+		)
+	}
+
+	if assignments[0].Name != "lr" {
+		t.Errorf(
+			"expected parameter name lr, got %q",
+			assignments[0].Name,
+		)
+	}
+
+	if assignments[0].Value != "0.03" {
+		t.Errorf(
+			"expected parameter value 0.03, got %q",
+			assignments[0].Value,
+		)
+	}
+
+	if trial.Status == nil {
+		t.Fatal("expected trial status")
+	}
+
+	observation := trial.Status.Observation
+
+	if observation == nil {
+		t.Fatal("expected observation")
+	}
+
+	if len(observation.Metrics) != 1 {
+		t.Fatalf(
+			"expected 1 metric, got %d",
+			len(observation.Metrics),
+		)
+	}
+
+	if observation.Metrics[0].Name != "accuracy" {
+		t.Errorf(
+			"expected metric accuracy, got %q",
+			observation.Metrics[0].Name,
+		)
+	}
+
+	if observation.Metrics[0].Value != "0.85" {
+		t.Errorf(
+			"expected metric value 0.85, got %q",
+			observation.Metrics[0].Value,
+		)
+	}
+}
+
+func TestReconcileOptimizationJob(t *testing.T) {
+	serviceName := optimizationjob.GetAlgorithmServiceName(getBaseOptJob())
+	completedTrial := func(name string, metrics []trainer.Metric) *trainer.TrainJob {
+		return &trainer.TrainJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: metav1.NamespaceDefault,
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: trainer.GroupVersion.String(),
+					Kind:       trainer.OptimizationJobKind,
+					Name:       "test-optjob",
+					UID:        "test-uid-123",
+					Controller: ptr.To(true),
+				}},
+			},
+			Status: trainer.TrainJobStatus{
+				Conditions:    []metav1.Condition{{Type: trainer.TrainJobComplete, Status: metav1.ConditionTrue}},
+				TrainerStatus: &trainer.TrainerStatus{Metrics: metrics},
+			},
+		}
+	}
+
+	optDeploy := &appsv1.Deployment{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
+		ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: metav1.NamespaceDefault},
+		Status:     appsv1.DeploymentStatus{AvailableReplicas: 1},
+	}
+	optSvc := &corev1.Service{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
+		ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: metav1.NamespaceDefault},
+	}
+
+	cases := map[string]struct {
+		getInitObjects        func() []client.Object
+		searchAlgorithmClient SearchAlgorithmClient
+		wantSuggestionCalls   int
+		wantRequestNumber     int32
+		failPatchDeploy       bool
+		failCreateTrainJob    bool
+		wantResult            reconcile.Result
+		wantErr               bool
+		getWantOptJob         func() *trainer.OptimizationJob
+		wantTrainJobs         int
+		wantDeployDeleted     bool
+		wantSvcDeleted        bool
+		wantFailureMessage    string
+	}{
+		"completed trial missing objective metric fails optimizationjob": {
+			getInitObjects: func() []client.Object {
+				return []client.Object{getBaseOptJob(), optDeploy, optSvc, completedTrial("tj-missing-metric", []trainer.Metric{{Name: "loss", Value: "0.1"}})}
+			},
+			searchAlgorithmClient: &mockSearchAlgorithmClient{},
+			wantTrainJobs:         1,
+			wantFailureMessage:    "completed trial \"tj-missing-metric\" did not report a valid objective metric \"accuracy\": objective metric is missing: \"accuracy\"",
+			getWantOptJob: func() *trainer.OptimizationJob {
+				job := getBaseOptJob()
+				job.Status = &trainer.OptimizationJobStatus{Conditions: []metav1.Condition{{
+					Type: constants.OptimizationJobFailed, Status: metav1.ConditionTrue, Reason: "ObjectiveMetricMissing",
+				}}}
+				return job
+			},
+		},
+		"completed trial with invalid objective metric fails optimizationjob": {
+			getInitObjects: func() []client.Object {
+				return []client.Object{getBaseOptJob(), optDeploy, optSvc, completedTrial("tj-invalid-metric", []trainer.Metric{{Name: "accuracy", Value: "NaN"}})}
+			},
+			searchAlgorithmClient: &mockSearchAlgorithmClient{},
+			wantTrainJobs:         1,
+			wantFailureMessage:    "completed trial \"tj-invalid-metric\" did not report a valid objective metric \"accuracy\": objective metric \"accuracy\" has invalid value \"NaN\"",
+			getWantOptJob: func() *trainer.OptimizationJob {
+				job := getBaseOptJob()
+				job.Status = &trainer.OptimizationJobStatus{Conditions: []metav1.Condition{{
+					Type: constants.OptimizationJobFailed, Status: metav1.ConditionTrue, Reason: "ObjectiveMetricInvalid",
+				}}}
+				return job
+			},
+		},
+		"fail when search algorithm is unsupported": {
+			getInitObjects: func() []client.Object {
+				job := getBaseOptJob()
+				job.Spec.SearchAlgorithm = &trainer.SearchAlgorithm{
+					Grid: &trainer.GridAlgorithm{},
+				}
+				return []client.Object{job}
+			},
+			wantErr: false,
+			getWantOptJob: func() *trainer.OptimizationJob {
+				job := getBaseOptJob()
+				job.Spec.SearchAlgorithm = &trainer.SearchAlgorithm{
+					Grid: &trainer.GridAlgorithm{},
+				}
+				job.Status = &trainer.OptimizationJobStatus{
+					Conditions: []metav1.Condition{
+						{
+							Type:    constants.OptimizationJobFailed,
+							Status:  metav1.ConditionTrue,
+							Reason:  "UnsupportedSearchAlgorithm",
+							Message: "Only 'random' search algorithm is supported in phase 1",
+						},
+					},
+				}
+				return job
+			},
+		},
+		"deploy algorithm service and wait when not ready": {
+			getInitObjects: func() []client.Object { return []client.Object{getBaseOptJob()} },
+			getWantOptJob: func() *trainer.OptimizationJob {
+				job := getBaseOptJob()
+				return job
+			},
+		},
+		"scale up new trials based on mocked suggestions": {
+			getInitObjects: func() []client.Object { return []client.Object{getBaseOptJob(), optDeploy, optSvc} },
+			searchAlgorithmClient: &mockSearchAlgorithmClient{
+				mockedAssignments: [][]trainer.ParameterAssignment{
+					{{Name: "lr", Value: "0.03"}},
+				},
+			},
+			wantResult: ctrl.Result{RequeueAfter: trialCacheRequeueDelay},
+			getWantOptJob: func() *trainer.OptimizationJob {
+				job := getBaseOptJob()
+				job.Status = &trainer.OptimizationJobStatus{
+					Conditions: []metav1.Condition{
+						{
+							Type:    constants.OptimizationJobCreated,
+							Status:  metav1.ConditionTrue,
+							Reason:  "AlgorithmServiceCreated",
+							Message: "Search algorithm service is running",
+						},
+					},
+				}
+				return job
+			},
+			wantTrainJobs:       1,
+			wantSuggestionCalls: 1,
+		},
+		"duplicate suggestions create distinct trials": {
+			getInitObjects: func() []client.Object {
+				job := getBaseOptJob()
+				job.Spec.ParallelTrials = 2
+				return []client.Object{job, optDeploy, optSvc}
+			},
+			searchAlgorithmClient: &mockSearchAlgorithmClient{
+				mockedAssignments: [][]trainer.ParameterAssignment{
+					{{Name: "lr", Value: "0.03"}},
+					{{Name: "lr", Value: "0.03"}},
+				},
+			},
+			wantRequestNumber:   2,
+			wantSuggestionCalls: 1,
+			wantTrainJobs:       2,
+			wantResult:          ctrl.Result{RequeueAfter: trialCacheRequeueDelay},
+			getWantOptJob: func() *trainer.OptimizationJob {
+				job := getBaseOptJob()
+				job.Spec.ParallelTrials = 2
+				job.Status = &trainer.OptimizationJobStatus{
+					Conditions: []metav1.Condition{
+						{
+							Type:    constants.OptimizationJobCreated,
+							Status:  metav1.ConditionTrue,
+							Reason:  "AlgorithmServiceCreated",
+							Message: "Search algorithm service is running",
+						},
+					},
+				}
+				return job
+			},
+		},
+		"fail reconciliation when suggestions are incomplete": {
+			getInitObjects: func() []client.Object { return []client.Object{getBaseOptJob(), optDeploy, optSvc} },
+			searchAlgorithmClient: &mockSearchAlgorithmClient{
+				mockedAssignments: nil,
+			},
+			wantSuggestionCalls: 1,
+			wantErr:             true,
+		},
+		"mark optimizationjob complete when all trials finish": {
+			getInitObjects: func() []client.Object {
+				job := getBaseOptJob()
+				job.Status = &trainer.OptimizationJobStatus{
+					Conditions: []metav1.Condition{
+						{
+							Type:    constants.OptimizationJobCreated,
+							Status:  metav1.ConditionTrue,
+							Reason:  "AlgorithmServiceCreated",
+							Message: "Search algorithm service is running",
+						},
+					},
+				}
+				return []client.Object{
+					job,
+					optDeploy,
+					optSvc,
+					&trainer.TrainJob{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "tj-1",
+							Namespace: metav1.NamespaceDefault,
+							Labels:    map[string]string{constants.OptimizationJobNameLabel: "test-optjob"},
+							OwnerReferences: []metav1.OwnerReference{
+								{
+									APIVersion: trainer.GroupVersion.String(),
+									Kind:       "OptimizationJob",
+									Name:       "test-optjob",
+									UID:        "test-uid-123",
+									Controller: ptr.To(true),
+								},
+							},
+						},
+						Spec: trainer.TrainJobSpec{
+							Trainer: &trainer.Trainer{
+								Env: []corev1.EnvVar{
+									{Name: constants.EnvVarPrefix + "lr", Value: "0.01"},
+								},
+							},
+						},
+						Status: trainer.TrainJobStatus{
+							Conditions:    []metav1.Condition{{Type: trainer.TrainJobComplete, Status: metav1.ConditionTrue}},
+							TrainerStatus: &trainer.TrainerStatus{Metrics: []trainer.Metric{{Name: "accuracy", Value: "0.80"}}},
+						},
+					},
+					&trainer.TrainJob{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "tj-2",
+							Namespace: metav1.NamespaceDefault,
+							Labels:    map[string]string{constants.OptimizationJobNameLabel: "test-optjob"},
+							OwnerReferences: []metav1.OwnerReference{
+								{
+									APIVersion: trainer.GroupVersion.String(),
+									Kind:       "OptimizationJob",
+									Name:       "test-optjob",
+									UID:        "test-uid-123",
+									Controller: ptr.To(true),
+								},
+							},
+						},
+						Spec: trainer.TrainJobSpec{
+							Trainer: &trainer.Trainer{
+								Env: []corev1.EnvVar{
+									{Name: constants.EnvVarPrefix + "lr", Value: "0.05"},
+								},
+							},
+						},
+						Status: trainer.TrainJobStatus{
+							Conditions:    []metav1.Condition{{Type: trainer.TrainJobComplete, Status: metav1.ConditionTrue}},
+							TrainerStatus: &trainer.TrainerStatus{Metrics: []trainer.Metric{{Name: "accuracy", Value: "0.95"}}},
+						},
+					},
+				}
+			},
+			getWantOptJob: func() *trainer.OptimizationJob {
+				job := getBaseOptJob()
+				job.Status = &trainer.OptimizationJobStatus{
+					Conditions: []metav1.Condition{
+						{
+							Type:    constants.OptimizationJobCreated,
+							Status:  metav1.ConditionTrue,
+							Reason:  "AlgorithmServiceCreated",
+							Message: "Search algorithm service is running",
+						},
+						{
+							Type:    constants.OptimizationJobComplete,
+							Status:  metav1.ConditionTrue,
+							Reason:  "OptimizationJobCompleted",
+							Message: "All trials have completed successfully",
+						},
+					},
+					Result: trainer.Result{
+						TrainJobName: "tj-2",
+						Parameters:   []trainer.ParameterAssignment{{Name: "lr", Value: "0.05"}},
+					},
+				}
+				return job
+			},
+			wantTrainJobs: 2,
+		},
+		"a trial failed marks optimizationjob failed": {
+			getInitObjects: func() []client.Object {
+				job := getBaseOptJob()
+				job.Spec.NumTrials = 2
+				job.Spec.ParallelTrials = 2
+				job.Status = &trainer.OptimizationJobStatus{
+					Conditions: []metav1.Condition{
+						{
+							Type:    constants.OptimizationJobCreated,
+							Status:  metav1.ConditionTrue,
+							Reason:  "AlgorithmServiceCreated",
+							Message: "Search algorithm service is running",
+						},
+					},
+				}
+
+				failedTrial1 := &trainer.TrainJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "tj-failed-1",
+						Namespace: metav1.NamespaceDefault,
+						Labels: map[string]string{
+							constants.OptimizationJobNameLabel: "test-optjob",
+						},
+						OwnerReferences: []metav1.OwnerReference{
+							{
+								APIVersion: trainer.GroupVersion.String(),
+								Kind:       "OptimizationJob",
+								Name:       "test-optjob",
+								UID:        "test-uid-123",
+								Controller: ptr.To(true),
+							},
+						},
+					},
+					Status: trainer.TrainJobStatus{
+						Conditions: []metav1.Condition{
+							{
+								Type:   trainer.TrainJobFailed,
+								Status: metav1.ConditionTrue,
+								Reason: "JobFailed",
+							},
+						},
+						TrainerStatus: &trainer.TrainerStatus{
+							Metrics: []trainer.Metric{{Name: "accuracy", Value: "0.99"}},
+						},
+					},
+				}
+
+				failedTrial2 := &trainer.TrainJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "tj-failed-2",
+						Namespace: metav1.NamespaceDefault,
+						Labels: map[string]string{
+							constants.OptimizationJobNameLabel: "test-optjob",
+						},
+						OwnerReferences: []metav1.OwnerReference{
+							{
+								APIVersion: trainer.GroupVersion.String(),
+								Kind:       "OptimizationJob",
+								Name:       "test-optjob",
+								UID:        "test-uid-123",
+								Controller: ptr.To(true),
+							},
+						},
+					},
+					Status: trainer.TrainJobStatus{
+						Conditions: []metav1.Condition{
+							{
+								Type:   trainer.TrainJobFailed,
+								Status: metav1.ConditionTrue,
+								Reason: "JobFailed",
+							},
+						},
+					},
+				}
+
+				return []client.Object{
+					job,
+					optDeploy,
+					optSvc,
+					failedTrial1,
+					failedTrial2,
+				}
+			},
+			getWantOptJob: func() *trainer.OptimizationJob {
+				job := getBaseOptJob()
+				job.Spec.NumTrials = 2
+				job.Spec.ParallelTrials = 2
+
+				job.Status = &trainer.OptimizationJobStatus{
+					Conditions: []metav1.Condition{
+						{
+							Type:    constants.OptimizationJobCreated,
+							Status:  metav1.ConditionTrue,
+							Reason:  "AlgorithmServiceCreated",
+							Message: "Search algorithm service is running",
+						},
+						{
+							Type:    constants.OptimizationJobFailed,
+							Status:  metav1.ConditionTrue,
+							Reason:  "TrialFailed",
+							Message: "2 trial(s) failed",
+						},
+					},
+				}
+				return job
+			},
+			wantTrainJobs: 2,
+		},
+		"minimize objective selects the lowest metric": {
+			getInitObjects: func() []client.Object {
+				minJob := getBaseOptJob()
+				minJob.Spec.Objectives = []trainer.Objective{
+					{Metric: "loss", Direction: trainer.ObjectiveDirectionMinimize},
+				}
+				minJob.Status = &trainer.OptimizationJobStatus{
+					Conditions: []metav1.Condition{
+						{
+							Type:    constants.OptimizationJobCreated,
+							Status:  metav1.ConditionTrue,
+							Reason:  "AlgorithmServiceCreated",
+							Message: "Search algorithm service is running",
+						},
+					},
+				}
+
+				return []client.Object{
+					minJob,
+					optDeploy,
+					optSvc,
+					&trainer.TrainJob{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "tj-1",
+							Namespace: metav1.NamespaceDefault,
+							Labels:    map[string]string{constants.OptimizationJobNameLabel: "test-optjob"},
+							OwnerReferences: []metav1.OwnerReference{
+								{
+									APIVersion: trainer.GroupVersion.String(),
+									Kind:       "OptimizationJob",
+									Name:       "test-optjob",
+									UID:        "test-uid-123",
+									Controller: ptr.To(true),
+								},
+							},
+						},
+						Spec: trainer.TrainJobSpec{
+							Trainer: &trainer.Trainer{
+								Env: []corev1.EnvVar{
+									{Name: constants.EnvVarPrefix + "lr", Value: "0.01"},
+								},
+							},
+						},
+						Status: trainer.TrainJobStatus{
+							Conditions:    []metav1.Condition{{Type: trainer.TrainJobComplete, Status: metav1.ConditionTrue}},
+							TrainerStatus: &trainer.TrainerStatus{Metrics: []trainer.Metric{{Name: "loss", Value: "0.50"}}},
+						},
+					},
+					&trainer.TrainJob{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "tj-2",
+							Namespace: metav1.NamespaceDefault,
+							Labels:    map[string]string{constants.OptimizationJobNameLabel: "test-optjob"},
+							OwnerReferences: []metav1.OwnerReference{
+								{
+									APIVersion: trainer.GroupVersion.String(),
+									Kind:       "OptimizationJob",
+									Name:       "test-optjob",
+									UID:        "test-uid-123",
+									Controller: ptr.To(true),
+								},
+							},
+						},
+						Spec: trainer.TrainJobSpec{
+							Trainer: &trainer.Trainer{
+								Env: []corev1.EnvVar{
+									{Name: constants.EnvVarPrefix + "lr", Value: "0.05"},
+								},
+							},
+						},
+						Status: trainer.TrainJobStatus{
+							Conditions:    []metav1.Condition{{Type: trainer.TrainJobComplete, Status: metav1.ConditionTrue}},
+							TrainerStatus: &trainer.TrainerStatus{Metrics: []trainer.Metric{{Name: "loss", Value: "0.10"}}},
+						},
+					},
+				}
+			},
+			getWantOptJob: func() *trainer.OptimizationJob {
+				job := getBaseOptJob()
+				job.Spec.Objectives = []trainer.Objective{
+					{Metric: "loss", Direction: trainer.ObjectiveDirectionMinimize},
+				}
+				job.Status = &trainer.OptimizationJobStatus{
+					Conditions: []metav1.Condition{
+						{
+							Type:    constants.OptimizationJobCreated,
+							Status:  metav1.ConditionTrue,
+							Reason:  "AlgorithmServiceCreated",
+							Message: "Search algorithm service is running",
+						},
+						{
+							Type:    constants.OptimizationJobComplete,
+							Status:  metav1.ConditionTrue,
+							Reason:  "OptimizationJobCompleted",
+							Message: "All trials have completed successfully",
+						},
+					},
+					Result: trainer.Result{
+						TrainJobName: "tj-2",
+						Parameters:   []trainer.ParameterAssignment{{Name: "lr", Value: "0.05"}},
+					},
+				}
+				return job
+			},
+			wantTrainJobs: 2,
+		},
+		"respect parallel trials budget": {
+			getInitObjects: func() []client.Object {
+				job := getBaseOptJob()
+				job.Spec.NumTrials = 5
+				job.Spec.ParallelTrials = 1
+				return []client.Object{
+					job,
+					optDeploy,
+					optSvc,
+					&trainer.TrainJob{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "tj-running",
+							Namespace: metav1.NamespaceDefault,
+							Labels:    map[string]string{constants.OptimizationJobNameLabel: "test-optjob"},
+							OwnerReferences: []metav1.OwnerReference{
+								{
+									APIVersion: trainer.GroupVersion.String(),
+									Kind:       "OptimizationJob",
+									Name:       "test-optjob",
+									UID:        "test-uid-123",
+									Controller: ptr.To(true),
+								},
+							},
+						},
+						Status: trainer.TrainJobStatus{},
+					},
+				}
+			},
+			searchAlgorithmClient: &mockSearchAlgorithmClient{
+				mockedAssignments: [][]trainer.ParameterAssignment{{{Name: "lr", Value: "0.99"}}},
+			},
+			getWantOptJob: func() *trainer.OptimizationJob {
+				job := getBaseOptJob()
+				job.Spec.NumTrials = 5
+				job.Spec.ParallelTrials = 1
+				job.Status = &trainer.OptimizationJobStatus{
+					Conditions: []metav1.Condition{
+						{
+							Type:    constants.OptimizationJobCreated,
+							Status:  metav1.ConditionTrue,
+							Reason:  "AlgorithmServiceCreated",
+							Message: "Search algorithm service is running",
+						},
+					},
+				}
+				return job
+			},
+			wantTrainJobs:       1,
+			wantSuggestionCalls: 0,
+		},
+		"fail reconciliation on suggestion service error": {
+			getInitObjects: func() []client.Object { return []client.Object{getBaseOptJob(), optDeploy, optSvc} },
+			searchAlgorithmClient: &mockSearchAlgorithmClient{
+				err: fmt.Errorf("connection refused"),
+			},
+			wantErr: true,
+			getWantOptJob: func() *trainer.OptimizationJob {
+				job := getBaseOptJob()
+				job.Status = &trainer.OptimizationJobStatus{
+					Conditions: []metav1.Condition{
+						{
+							Type:    constants.OptimizationJobCreated,
+							Status:  metav1.ConditionTrue,
+							Reason:  "AlgorithmServiceCreated",
+							Message: "Search algorithm service is running",
+						},
+					},
+				}
+				return job
+			},
+			wantTrainJobs:       0,
+			wantSuggestionCalls: 1,
+		},
+		"fail on algorithm service deployment creation": {
+			getInitObjects:  func() []client.Object { return []client.Object{getBaseOptJob()} },
+			failPatchDeploy: true,
+			wantErr:         true,
+			getWantOptJob: func() *trainer.OptimizationJob {
+				job := getBaseOptJob()
+				return job
+			},
+		},
+		"fail on trainjob creation": {
+			getInitObjects: func() []client.Object { return []client.Object{getBaseOptJob(), optDeploy, optSvc} },
+			searchAlgorithmClient: &mockSearchAlgorithmClient{
+				mockedAssignments: [][]trainer.ParameterAssignment{{{Name: "lr", Value: "0.03"}}},
+			},
+			failCreateTrainJob:  true,
+			wantErr:             true,
+			wantSuggestionCalls: 1,
+			getWantOptJob: func() *trainer.OptimizationJob {
+				job := getBaseOptJob()
+				job.Status = &trainer.OptimizationJobStatus{
+					Conditions: []metav1.Condition{
+						{
+							Type:    constants.OptimizationJobCreated,
+							Status:  metav1.ConditionTrue,
+							Reason:  "AlgorithmServiceCreated",
+							Message: "Search algorithm service is running",
+						},
+					},
+				}
+				return job
+			},
+		},
+		"optimizationjob status is nil": {
+			getInitObjects: func() []client.Object { return []client.Object{getBaseOptJob()} },
+			wantErr:        false,
+			getWantOptJob: func() *trainer.OptimizationJob {
+				job := getBaseOptJob()
+				return job
+			},
+		},
+		"cleanup algorithm service when optimizationjob is completed": {
+			getInitObjects: func() []client.Object {
+				job := getBaseOptJob()
+				job.Status = &trainer.OptimizationJobStatus{
+					Conditions: []metav1.Condition{
+						{
+							Type:    constants.OptimizationJobComplete,
+							Status:  metav1.ConditionTrue,
+							Reason:  "OptimizationJobCompleted",
+							Message: "All trials have completed successfully",
+						},
+					},
+				}
+				return []client.Object{job, optDeploy, optSvc}
+			},
+			wantErr:           false,
+			wantDeployDeleted: true,
+			wantSvcDeleted:    true,
+			getWantOptJob: func() *trainer.OptimizationJob {
+				job := getBaseOptJob()
+				job.Status = &trainer.OptimizationJobStatus{
+					Conditions: []metav1.Condition{
+						{
+							Type:    constants.OptimizationJobComplete,
+							Status:  metav1.ConditionTrue,
+							Reason:  "OptimizationJobCompleted",
+							Message: "All trials have completed successfully",
+						},
+					},
+				}
+				return job
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, ctx := ktesting.NewTestContext(t)
+			var cancel func()
+			ctx, cancel = context.WithCancel(ctx)
+			t.Cleanup(cancel)
+
+			testScheme := runtime.NewScheme()
+			_ = corev1.AddToScheme(testScheme)
+			_ = appsv1.AddToScheme(testScheme)
+			_ = trainer.AddToScheme(testScheme)
+
+			initObjs := tc.getInitObjects()
+
+			builder := utiltesting.NewClientBuilder().
+				WithScheme(testScheme).
+				WithStatusSubresource(
+					&trainer.OptimizationJob{},
+					&trainer.TrainJob{},
+					&appsv1.Deployment{},
+				).
+				WithObjects(initObjs...)
+
+			if err := SetupIndexes(ctx, utiltesting.AsIndex(builder)); err != nil {
+				t.Fatalf("Failed to setup indexes: %v", err)
+			}
+			baseCli := builder.Build()
+
+			mockCli := &mockFailingClient{
+				Client:             baseCli,
+				failPatchDeploy:    tc.failPatchDeploy,
+				failCreateTrainJob: tc.failCreateTrainJob,
+			}
+
+			algorithmClient := tc.searchAlgorithmClient
+			if algorithmClient == nil {
+				algorithmClient = &DefaultSearchAlgorithmClient{}
+			}
+
+			r := &OptimizationJobReconciler{
+				Client:                mockCli,
+				Scheme:                testScheme,
+				Log:                   ctrl.Log.WithName("optimizationjob-controller"),
+				Recorder:              &events.FakeRecorder{},
+				SearchAlgorithmClient: algorithmClient,
+				APIReader:             mockCli,
+				clock:                 clocktesting.NewFakePassiveClock(time.Now()),
+				pendingTrials:         make(map[types.NamespacedName]*trialCreationExpectations),
+			}
+
+			runtimeKey := types.NamespacedName{
+				Name:      "test-optjob",
+				Namespace: metav1.NamespaceDefault,
+			}
+			res, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: runtimeKey})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Reconcile() error = %v, wantErr %v", err, tc.wantErr)
+			}
+
+			// Suggestion client assertions
+			if tc.searchAlgorithmClient != nil {
+				mockClient, ok := tc.searchAlgorithmClient.(*mockSearchAlgorithmClient)
+				if !ok {
+					t.Fatalf("expected *mockSearchAlgorithmClient, got %T", tc.searchAlgorithmClient)
+				}
+
+				if mockClient.calls != tc.wantSuggestionCalls {
+					t.Fatalf(
+						"expected SearchAlgorithmClient to be called %d times, got %d",
+						tc.wantSuggestionCalls,
+						mockClient.calls,
+					)
+				}
+
+				if tc.wantSuggestionCalls > 0 {
+					if mockClient.lastReq == nil {
+						t.Fatal("expected SearchAlgorithmClient request to be captured")
+					}
+
+					wantRequestNumber := tc.wantRequestNumber
+					if wantRequestNumber == 0 {
+						wantRequestNumber = 1
+					}
+					if mockClient.lastReq.CurrentRequestNumber != wantRequestNumber {
+						t.Errorf(
+							"expected CurrentRequestNumber=%d, got %d",
+							wantRequestNumber,
+							mockClient.lastReq.CurrentRequestNumber,
+						)
+					}
+				}
+			}
+
+			if diff := cmp.Diff(tc.wantResult, res); len(diff) != 0 {
+				t.Errorf("Unexpected Reconcile() result (-want, +got):\n%s", diff)
+			}
+
+			if err != nil {
+				// Expected error case.
+				return
+			}
+
+			var gotJob trainer.OptimizationJob
+			if err := baseCli.Get(ctx, runtimeKey, &gotJob); err != nil {
+				t.Fatalf("Get() returned error: %v", err)
+			}
+			if tc.wantFailureMessage != "" {
+				condition := meta.FindStatusCondition(gotJob.Status.Conditions, constants.OptimizationJobFailed)
+				if condition == nil || condition.Message != tc.wantFailureMessage {
+					t.Errorf("failure condition = %v, want message %q", condition, tc.wantFailureMessage)
+				}
+			}
+
+			wantOptJob := tc.getWantOptJob()
+			if diff := cmp.Diff(wantOptJob, &gotJob,
+				cmpopts.IgnoreFields(metav1.ObjectMeta{}, "ResourceVersion", "UID"),
+				cmpopts.IgnoreFields(metav1.TypeMeta{}, "Kind", "APIVersion"),
+				cmpopts.IgnoreFields(metav1.Condition{}, "LastTransitionTime", "Message"),
+			); len(diff) != 0 {
+				t.Errorf("Unexpected OptimizationJob status (-want, +got): \n%s", diff)
+			}
+
+			if tc.wantTrainJobs > 0 {
+				var trainJobs trainer.TrainJobList
+				if err := baseCli.List(ctx, &trainJobs, client.InNamespace(metav1.NamespaceDefault)); err != nil {
+					t.Fatalf("Failed to list TrainJobs: %v", err)
+				}
+				if len(trainJobs.Items) != tc.wantTrainJobs {
+					t.Errorf("Expected %d TrainJobs, got %d", tc.wantTrainJobs, len(trainJobs.Items))
+				}
+				if tc.wantTrainJobs == 2 && len(trainJobs.Items) >= 2 {
+					if name1, name2 := trainJobs.Items[0].Name, trainJobs.Items[1].Name; name1 == name2 {
+						t.Errorf("expected distinct TrainJob names, got %q for both trials", name1)
+					}
+				}
+			}
+
+			if tc.wantDeployDeleted {
+				var deploy appsv1.Deployment
+				getErr := baseCli.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: metav1.NamespaceDefault}, &deploy)
+				if !apierrors.IsNotFound(getErr) {
+					t.Errorf("expected Deployment to be deleted, got err: %v", getErr)
+				}
+			}
+
+			if tc.wantSvcDeleted {
+				var svc corev1.Service
+				getErr := baseCli.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: metav1.NamespaceDefault}, &svc)
+				if !apierrors.IsNotFound(getErr) {
+					t.Errorf("expected Service to be deleted, got err: %v", getErr)
+				}
+			}
+		})
+	}
+}
+
+func TestReconcileTrialCreationExpectations(t *testing.T) {
+	getBaseOptJob := func() *trainer.OptimizationJob {
+		return &trainer.OptimizationJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-optjob",
+				Namespace: "default",
+				UID:       types.UID("optjob-uid"),
+			},
+			Spec: trainer.OptimizationJobSpec{
+				NumTrials:      3,
+				ParallelTrials: 2,
+				SearchAlgorithm: &trainer.SearchAlgorithm{
+					Random: &trainer.RandomAlgorithm{},
+				},
+			},
+		}
+	}
+
+	makeTrainJob := func(name string) *trainer.TrainJob {
+		return &trainer.TrainJob{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: "default",
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: trainer.GroupVersion.String(),
+					Kind:       trainer.OptimizationJobKind,
+					Name:       "test-optjob",
+					UID:        "optjob-uid",
+					Controller: ptr.To(true),
+				}},
+			},
+		}
+	}
+
+	getAlgorithmServiceAndDeploy := func(optJob *trainer.OptimizationJob) (*corev1.Service, *appsv1.Deployment) {
+		svcName := optimizationjob.GetAlgorithmServiceName(optJob)
+		svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: svcName, Namespace: optJob.Namespace}}
+		deploy := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: svcName, Namespace: optJob.Namespace},
+			Status:     appsv1.DeploymentStatus{AvailableReplicas: 1},
+		}
+		return svc, deploy
+	}
+
+	optJobKey := types.NamespacedName{Name: "test-optjob", Namespace: "default"}
+
+	cases := map[string]struct {
+		objs                []client.Object
+		omitOptJob          bool
+		cachedTrainJobs     sets.Set[string]
+		pendingTrials       map[string]time.Duration // Maps trial name to age offset
+		failCreate          map[int]bool             // call index -> persisted?
+		liveReadErr         error
+		wantResult          ctrl.Result
+		wantErr             bool
+		wantSuggestionCalls int
+		wantRequestNumber   *int32
+		wantPendingTrials   int
+		wantTrainJobs       *int
+	}{
+		"hidden trials hold the parallel budget": {
+			cachedTrainJobs:   sets.New[string](),
+			pendingTrials:     map[string]time.Duration{"trial-1": 0, "trial-2": 0},
+			wantResult:        ctrl.Result{RequeueAfter: trialCacheRequeueDelay},
+			wantPendingTrials: 2,
+		},
+		"partially observed trials hold budget": {
+			cachedTrainJobs:   sets.New[string]("trial-1"),
+			pendingTrials:     map[string]time.Duration{"trial-2": 0},
+			wantResult:        ctrl.Result{RequeueAfter: trialCacheRequeueDelay},
+			wantPendingTrials: 1,
+		},
+		"overdue trial that is still live retains slot": {
+			objs:              []client.Object{makeTrainJob("trial-1")},
+			cachedTrainJobs:   sets.New[string](),
+			pendingTrials:     map[string]time.Duration{"trial-1": -40 * time.Second},
+			wantResult:        ctrl.Result{RequeueAfter: trialCacheRequeueDelay},
+			wantPendingTrials: 1,
+		},
+		"overdue trial that was deleted frees its slot": {
+			objs:                []client.Object{},
+			cachedTrainJobs:     sets.New[string](),
+			pendingTrials:       map[string]time.Duration{"trial-1": -40 * time.Second},
+			wantResult:          ctrl.Result{RequeueAfter: trialCacheRequeueDelay},
+			wantSuggestionCalls: 1,
+			wantPendingTrials:   2,
+		},
+		"overdue trial owned by another UID frees slot": {
+			objs: []client.Object{
+				&trainer.TrainJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "trial-1",
+						Namespace: "default",
+						OwnerReferences: []metav1.OwnerReference{{
+							APIVersion: trainer.GroupVersion.String(),
+							Kind:       trainer.OptimizationJobKind,
+							Name:       "test-optjob",
+							UID:        "different-uid",
+							Controller: ptr.To(true),
+						}},
+					},
+				},
+			},
+			cachedTrainJobs:     sets.New[string](),
+			pendingTrials:       map[string]time.Duration{"trial-1": -40 * time.Second},
+			wantResult:          ctrl.Result{RequeueAfter: trialCacheRequeueDelay},
+			wantSuggestionCalls: 1,
+			wantPendingTrials:   2,
+		},
+		"live-read error retains slot": {
+			cachedTrainJobs:   sets.New[string](),
+			pendingTrials:     map[string]time.Duration{"trial-1": -40 * time.Second},
+			liveReadErr:       fmt.Errorf("api server down"),
+			wantErr:           true,
+			wantPendingTrials: 1,
+		},
+		"create rejected clears slot and returns error": {
+			failCreate:          map[int]bool{1: false, 2: false},
+			wantSuggestionCalls: 1,
+			wantErr:             true,
+			wantPendingTrials:   0,
+			wantTrainJobs:       ptr.To(0),
+		},
+		"retry after create rejected succeeds when slot was cleared": {
+			wantSuggestionCalls: 1,
+			wantResult:          ctrl.Result{RequeueAfter: trialCacheRequeueDelay},
+			wantPendingTrials:   2,
+			wantTrainJobs:       ptr.To(2),
+		},
+		"response lost after object was saved retains slot": {
+			failCreate:          map[int]bool{1: true, 2: true},
+			wantSuggestionCalls: 1,
+			wantErr:             false,
+			wantResult:          ctrl.Result{RequeueAfter: trialCacheRequeueDelay},
+			wantPendingTrials:   2,
+			wantTrainJobs:       ptr.To(2),
+		},
+		"partial batch create failure retains succeeded trial": {
+			cachedTrainJobs:     sets.New[string](),
+			failCreate:          map[int]bool{2: false},
+			wantSuggestionCalls: 1,
+			wantErr:             true,
+			wantPendingTrials:   1,
+			wantTrainJobs:       ptr.To(1),
+		},
+		"retry while succeeded trial is still hidden delays spawning more trials": {
+			objs:              []client.Object{makeTrainJob("trial-1")},
+			cachedTrainJobs:   sets.New[string](),
+			pendingTrials:     map[string]time.Duration{"trial-1": 0},
+			wantResult:        ctrl.Result{RequeueAfter: trialCacheRequeueDelay},
+			wantPendingTrials: 1,
+			wantTrainJobs:     ptr.To(1),
+		},
+		"retry after succeeded trial is observed by cache requests remaining trial": {
+			objs:                []client.Object{makeTrainJob("trial-1")},
+			cachedTrainJobs:     sets.New[string]("trial-1"),
+			pendingTrials:       map[string]time.Duration{"trial-1": 0},
+			wantResult:          ctrl.Result{RequeueAfter: trialCacheRequeueDelay},
+			wantSuggestionCalls: 1,
+			wantRequestNumber:   ptr.To[int32](1),
+			wantPendingTrials:   1,
+			wantTrainJobs:       ptr.To(2),
+		},
+		"expectations cleared on job Complete": {
+			objs: []client.Object{
+				&trainer.OptimizationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-optjob",
+						Namespace: metav1.NamespaceDefault,
+						UID:       types.UID("optjob-uid"),
+					},
+					Spec: trainer.OptimizationJobSpec{
+						NumTrials:      3,
+						ParallelTrials: 2,
+						SearchAlgorithm: &trainer.SearchAlgorithm{
+							Random: &trainer.RandomAlgorithm{},
+						},
+					},
+					Status: &trainer.OptimizationJobStatus{
+						Conditions: []metav1.Condition{
+							{Type: constants.OptimizationJobComplete, Status: metav1.ConditionTrue},
+						},
+					},
+				},
+			},
+			pendingTrials:     map[string]time.Duration{"trial-1": 0},
+			wantPendingTrials: 0,
+		},
+		"expectations cleared on job Failed": {
+			objs: []client.Object{
+				&trainer.TrainJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "failed-trial",
+						Namespace: "default",
+						OwnerReferences: []metav1.OwnerReference{{
+							APIVersion: trainer.GroupVersion.String(),
+							Kind:       trainer.OptimizationJobKind,
+							Name:       "test-optjob",
+							UID:        "optjob-uid",
+							Controller: ptr.To(true),
+						}},
+					},
+					Status: trainer.TrainJobStatus{
+						Conditions: []metav1.Condition{
+							{Type: trainer.TrainJobFailed, Status: metav1.ConditionTrue},
+						},
+					},
+				},
+			},
+			pendingTrials:     map[string]time.Duration{"trial-1": 0},
+			wantPendingTrials: 0,
+		},
+		"expectations cleared on unsupported algorithm": {
+			objs: []client.Object{
+				&trainer.OptimizationJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-optjob",
+						Namespace: metav1.NamespaceDefault,
+						UID:       types.UID("optjob-uid"),
+					},
+					Spec: trainer.OptimizationJobSpec{
+						NumTrials:       3,
+						ParallelTrials:  2,
+						SearchAlgorithm: &trainer.SearchAlgorithm{},
+					},
+				},
+			},
+			pendingTrials:     map[string]time.Duration{"trial-1": 0},
+			wantPendingTrials: 0,
+		},
+		"expectations cleared when OptimizationJob not found": {
+			omitOptJob:        true,
+			pendingTrials:     map[string]time.Duration{"trial-1": 0},
+			wantPendingTrials: 0,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, ctx := ktesting.NewTestContext(t)
+			optJob := getBaseOptJob()
+			svc, deploy := getAlgorithmServiceAndDeploy(optJob)
+
+			hasOptJob := false
+			for _, obj := range tc.objs {
+				if _, ok := obj.(*trainer.OptimizationJob); ok {
+					hasOptJob = true
+					break
+				}
+			}
+
+			initObjs := tc.objs
+			if !tc.omitOptJob && !hasOptJob {
+				initObjs = append(initObjs, optJob, svc, deploy)
+			} else if !tc.omitOptJob {
+				initObjs = append(initObjs, svc, deploy)
+			}
+
+			builder := utiltesting.NewClientBuilder().
+				WithStatusSubresource(&trainer.OptimizationJob{}, &trainer.TrainJob{}, &appsv1.Deployment{}).
+				WithObjects(initObjs...)
+
+			if err := SetupIndexes(ctx, utiltesting.AsIndex(builder)); err != nil {
+				t.Fatalf("Failed to setup indexes: %v", err)
+			}
+			baseClient := builder.Build()
+
+			cachedTrainJobs := tc.cachedTrainJobs
+			failCreate := tc.failCreate
+			liveReadErr := tc.liveReadErr
+			var createCalls int
+
+			clientWithInterceptors := interceptor.NewClient(baseClient, interceptor.Funcs{
+				List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+					if err := c.List(ctx, list, opts...); err != nil {
+						return err
+					}
+					if tjList, ok := list.(*trainer.TrainJobList); ok && cachedTrainJobs != nil {
+						var filtered []trainer.TrainJob
+						for _, tj := range tjList.Items {
+							if cachedTrainJobs.Has(tj.Name) {
+								filtered = append(filtered, tj)
+							}
+						}
+						tjList.Items = filtered
+					}
+					return nil
+				},
+				Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+					if _, ok := obj.(*trainer.TrainJob); ok {
+						createCalls++
+						if failCreate != nil {
+							if persisted, shouldFail := failCreate[createCalls]; shouldFail {
+								if persisted {
+									_ = c.Create(ctx, obj, opts...)
+								}
+								return fmt.Errorf("simulated Create error on call %d", createCalls)
+							}
+						}
+					}
+					return c.Create(ctx, obj, opts...)
+				},
+			})
+
+			var apiReader client.Reader = baseClient
+			if liveReadErr != nil {
+				apiReader = interceptor.NewClient(baseClient, interceptor.Funcs{
+					Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+						if _, ok := obj.(*trainer.TrainJob); ok {
+							return liveReadErr
+						}
+						return c.Get(ctx, key, obj, opts...)
+					},
+				})
+			}
+
+			suggestions := &mockSearchAlgorithmClient{
+				mockedAssignments: [][]trainer.ParameterAssignment{
+					{{Name: "lr", Value: "0.01"}},
+					{{Name: "lr", Value: "0.02"}},
+				},
+			}
+
+			now := time.Now()
+			r := &OptimizationJobReconciler{
+				Client:                clientWithInterceptors,
+				Scheme:                baseClient.Scheme(),
+				Recorder:              &events.FakeRecorder{},
+				SearchAlgorithmClient: suggestions,
+				APIReader:             apiReader,
+				clock:                 clocktesting.NewFakePassiveClock(now),
+				pendingTrials:         make(map[types.NamespacedName]*trialCreationExpectations),
+			}
+
+			if len(tc.pendingTrials) > 0 {
+				r.pendingTrials[optJobKey] = &trialCreationExpectations{
+					uid:   optJob.UID,
+					names: make(map[string]time.Time),
+				}
+				for name, ageOffset := range tc.pendingTrials {
+					r.pendingTrials[optJobKey].names[name] = now.Add(ageOffset)
+				}
+			}
+
+			req := reconcile.Request{NamespacedName: optJobKey}
+			res, err := r.Reconcile(ctx, req)
+
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Reconcile() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if diff := cmp.Diff(tc.wantResult, res); len(diff) != 0 {
+				t.Errorf("Unexpected Reconcile() result (-want, +got): \n%s", diff)
+			}
+			if suggestions.calls != tc.wantSuggestionCalls {
+				t.Errorf("suggestion calls = %d, want %d", suggestions.calls, tc.wantSuggestionCalls)
+			}
+			if tc.wantRequestNumber != nil {
+				if suggestions.lastReq == nil {
+					t.Fatalf("lastReq is nil, want request number %d", *tc.wantRequestNumber)
+				}
+				if suggestions.lastReq.CurrentRequestNumber != *tc.wantRequestNumber {
+					t.Errorf("last request number = %d, want %d", suggestions.lastReq.CurrentRequestNumber, *tc.wantRequestNumber)
+				}
+			}
+
+			gotPending := 0
+			if exps, ok := r.pendingTrials[optJobKey]; ok {
+				gotPending = len(exps.names)
+			}
+			if diff := cmp.Diff(tc.wantPendingTrials, gotPending); len(diff) != 0 {
+				t.Errorf("Unexpected pending trials count (-want, +got): \n%s", diff)
+			}
+
+			if tc.wantTrainJobs != nil {
+				var trainJobs trainer.TrainJobList
+				if err := baseClient.List(ctx, &trainJobs, client.InNamespace("default")); err != nil {
+					t.Fatalf("Failed to list TrainJobs from baseClient: %v", err)
+				}
+				if len(trainJobs.Items) != *tc.wantTrainJobs {
+					t.Errorf("TrainJobs count in baseClient = %d, want %d", len(trainJobs.Items), *tc.wantTrainJobs)
+				}
+			}
+		})
+	}
+}
+
+func TestExpectTrialCreation(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	key := types.NamespacedName{Namespace: "default", Name: "test-optjob"}
+	otherKey := types.NamespacedName{Namespace: "default", Name: "other-optjob"}
+
+	cases := map[string]struct {
+		initPending map[types.NamespacedName]*trialCreationExpectations
+		key         types.NamespacedName
+		uid         types.UID
+		name        string
+		wantPending map[types.NamespacedName]*trialCreationExpectations
+	}{
+		"add trial to empty pendingTrials": {
+			key:  key,
+			uid:  "uid-1",
+			name: "trial-1",
+			wantPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "uid-1", names: map[string]time.Time{"trial-1": now}},
+			},
+		},
+		"add trial to existing expectation with same UID": {
+			initPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "uid-1", names: map[string]time.Time{"trial-1": now}},
+			},
+			key:  key,
+			uid:  "uid-1",
+			name: "trial-2",
+			wantPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "uid-1", names: map[string]time.Time{"trial-1": now, "trial-2": now}},
+			},
+		},
+		"replace expectation if UID changes": {
+			initPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "old-uid", names: map[string]time.Time{"old-trial": now}},
+			},
+			key:  key,
+			uid:  "new-uid",
+			name: "new-trial",
+			wantPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "new-uid", names: map[string]time.Time{"new-trial": now}},
+			},
+		},
+		"add trial for different key preserves existing": {
+			initPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "uid-1", names: map[string]time.Time{"trial-1": now}},
+			},
+			key:  otherKey,
+			uid:  "uid-2",
+			name: "other-trial",
+			wantPending: map[types.NamespacedName]*trialCreationExpectations{
+				key:      {uid: "uid-1", names: map[string]time.Time{"trial-1": now}},
+				otherKey: {uid: "uid-2", names: map[string]time.Time{"other-trial": now}},
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			r := &OptimizationJobReconciler{
+				clock:         clocktesting.NewFakePassiveClock(now),
+				pendingTrials: tc.initPending,
+			}
+			r.expectTrialCreation(tc.key, tc.uid, tc.name)
+			if diff := cmp.Diff(tc.wantPending, r.pendingTrials, cmp.AllowUnexported(trialCreationExpectations{})); len(diff) != 0 {
+				t.Errorf("Unexpected pendingTrials (-want, +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestForgetTrialCreation(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	key := types.NamespacedName{Namespace: "default", Name: "test-optjob"}
+
+	cases := map[string]struct {
+		initPending map[types.NamespacedName]*trialCreationExpectations
+		key         types.NamespacedName
+		name        string
+		wantPending map[types.NamespacedName]*trialCreationExpectations
+	}{
+		"forget one of multiple trials leaves others": {
+			initPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "uid-1", names: map[string]time.Time{"trial-1": now, "trial-2": now}},
+			},
+			key:  key,
+			name: "trial-1",
+			wantPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "uid-1", names: map[string]time.Time{"trial-2": now}},
+			},
+		},
+		"forget last trial removes key from pendingTrials": {
+			initPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "uid-1", names: map[string]time.Time{"trial-1": now}},
+			},
+			key:         key,
+			name:        "trial-1",
+			wantPending: map[types.NamespacedName]*trialCreationExpectations{},
+		},
+		"forget nonexistent trial is no-op": {
+			initPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "uid-1", names: map[string]time.Time{"trial-1": now}},
+			},
+			key:  key,
+			name: "nonexistent",
+			wantPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "uid-1", names: map[string]time.Time{"trial-1": now}},
+			},
+		},
+		"forget on nonexistent key is no-op": {
+			initPending: map[types.NamespacedName]*trialCreationExpectations{},
+			key:         key,
+			name:        "trial-1",
+			wantPending: map[types.NamespacedName]*trialCreationExpectations{},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			r := &OptimizationJobReconciler{
+				pendingTrials: tc.initPending,
+			}
+			r.forgetTrialCreation(tc.key, tc.name)
+			if diff := cmp.Diff(tc.wantPending, r.pendingTrials, cmp.AllowUnexported(trialCreationExpectations{})); len(diff) != 0 {
+				t.Errorf("Unexpected pendingTrials (-want, +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestObserveTrialCreations(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	key := types.NamespacedName{Namespace: "default", Name: "test-optjob"}
+
+	cases := map[string]struct {
+		initPending map[types.NamespacedName]*trialCreationExpectations
+		key         types.NamespacedName
+		uid         types.UID
+		trainJobs   []trainer.TrainJob
+		clockOffset time.Duration
+		wantOverdue []string
+		wantPending map[types.NamespacedName]*trialCreationExpectations
+	}{
+		"no expectations returns nil": {
+			key:         key,
+			uid:         "uid-1",
+			wantOverdue: nil,
+			wantPending: nil,
+		},
+		"UID mismatch deletes expectations and returns nil": {
+			initPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "old-uid", names: map[string]time.Time{"trial-1": now}},
+			},
+			key:         key,
+			uid:         "new-uid",
+			wantOverdue: nil,
+			wantPending: map[types.NamespacedName]*trialCreationExpectations{},
+		},
+		"observed trial is removed from expectations": {
+			initPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "uid-1", names: map[string]time.Time{"trial-1": now, "trial-2": now}},
+			},
+			key: key,
+			uid: "uid-1",
+			trainJobs: []trainer.TrainJob{
+				{ObjectMeta: metav1.ObjectMeta{Name: "trial-1"}},
+			},
+			wantOverdue: nil,
+			wantPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "uid-1", names: map[string]time.Time{"trial-2": now}},
+			},
+		},
+		"all observed trials deletes expectations entry": {
+			initPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "uid-1", names: map[string]time.Time{"trial-1": now}},
+			},
+			key: key,
+			uid: "uid-1",
+			trainJobs: []trainer.TrainJob{
+				{ObjectMeta: metav1.ObjectMeta{Name: "trial-1"}},
+			},
+			wantOverdue: nil,
+			wantPending: map[types.NamespacedName]*trialCreationExpectations{},
+		},
+		"unobserved trial overdue returns overdue name": {
+			initPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "uid-1", names: map[string]time.Time{"trial-1": now}},
+			},
+			key:         key,
+			uid:         "uid-1",
+			clockOffset: trialExpectationVerifyDelay + time.Second,
+			wantOverdue: []string{"trial-1"},
+			wantPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "uid-1", names: map[string]time.Time{"trial-1": now}},
+			},
+		},
+		"unobserved trial not yet overdue returns nil": {
+			initPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "uid-1", names: map[string]time.Time{"trial-1": now}},
+			},
+			key:         key,
+			uid:         "uid-1",
+			clockOffset: trialExpectationVerifyDelay - time.Second,
+			wantOverdue: nil,
+			wantPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "uid-1", names: map[string]time.Time{"trial-1": now}},
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			r := &OptimizationJobReconciler{
+				clock:         clocktesting.NewFakePassiveClock(now.Add(tc.clockOffset)),
+				pendingTrials: tc.initPending,
+			}
+			gotOverdue := r.observeTrialCreations(tc.key, tc.uid, tc.trainJobs)
+			if diff := cmp.Diff(tc.wantOverdue, gotOverdue); len(diff) != 0 {
+				t.Errorf("Unexpected overdue (-want, +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tc.wantPending, r.pendingTrials, cmp.AllowUnexported(trialCreationExpectations{})); len(diff) != 0 {
+				t.Errorf("Unexpected pendingTrials (-want, +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestVerifyPendingTrialCreations(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	optJob := &trainer.OptimizationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-optjob",
+			Namespace: "default",
+			UID:       "optjob-uid",
+		},
+	}
+	key := client.ObjectKeyFromObject(optJob)
+
+	cases := map[string]struct {
+		objs        []client.Object
+		readerErr   error
+		overdue     []string
+		initPending map[types.NamespacedName]*trialCreationExpectations
+		optJobUID   types.UID
+		wantCount   int32
+		wantErr     bool
+		wantPending map[types.NamespacedName]*trialCreationExpectations
+	}{
+		"overdue trial NotFound releases expectation": {
+			overdue: []string{"trial-1"},
+			initPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "optjob-uid", names: map[string]time.Time{"trial-1": now}},
+			},
+			optJobUID:   "optjob-uid",
+			wantCount:   0,
+			wantPending: map[types.NamespacedName]*trialCreationExpectations{},
+		},
+		"overdue trial live with matching owner UID is retained": {
+			objs: []client.Object{
+				&trainer.TrainJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "trial-1",
+						Namespace: "default",
+						OwnerReferences: []metav1.OwnerReference{{
+							APIVersion: trainer.GroupVersion.String(),
+							Kind:       trainer.OptimizationJobKind,
+							Name:       "test-optjob",
+							UID:        "optjob-uid",
+							Controller: ptr.To(true),
+						}},
+					},
+				},
+			},
+			overdue: []string{"trial-1"},
+			initPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "optjob-uid", names: map[string]time.Time{"trial-1": now}},
+			},
+			optJobUID: "optjob-uid",
+			wantCount: 1,
+			wantPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "optjob-uid", names: map[string]time.Time{"trial-1": now}},
+			},
+		},
+		"overdue trial live with different owner UID releases expectation": {
+			objs: []client.Object{
+				&trainer.TrainJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "trial-1",
+						Namespace: "default",
+						OwnerReferences: []metav1.OwnerReference{{
+							APIVersion: trainer.GroupVersion.String(),
+							Kind:       trainer.OptimizationJobKind,
+							Name:       "test-optjob",
+							UID:        "different-uid",
+							Controller: ptr.To(true),
+						}},
+					},
+				},
+			},
+			overdue: []string{"trial-1"},
+			initPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "optjob-uid", names: map[string]time.Time{"trial-1": now}},
+			},
+			optJobUID:   "optjob-uid",
+			wantCount:   0,
+			wantPending: map[types.NamespacedName]*trialCreationExpectations{},
+		},
+		"overdue trial live without controller owner releases expectation": {
+			objs: []client.Object{
+				&trainer.TrainJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "trial-1",
+						Namespace: "default",
+						OwnerReferences: []metav1.OwnerReference{{
+							UID: "optjob-uid",
+						}},
+					},
+				},
+			},
+			overdue: []string{"trial-1"},
+			initPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "optjob-uid", names: map[string]time.Time{"trial-1": now}},
+			},
+			optJobUID:   "optjob-uid",
+			wantCount:   0,
+			wantPending: map[types.NamespacedName]*trialCreationExpectations{},
+		},
+		"live read error returns error without modifying expectations": {
+			readerErr: fmt.Errorf("api connection error"),
+			overdue:   []string{"trial-1"},
+			initPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "optjob-uid", names: map[string]time.Time{"trial-1": now}},
+			},
+			optJobUID: "optjob-uid",
+			wantErr:   true,
+			wantPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "optjob-uid", names: map[string]time.Time{"trial-1": now}},
+			},
+		},
+		"pending trials UID mismatch returns 0": {
+			initPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "other-uid", names: map[string]time.Time{"trial-1": now}},
+			},
+			optJobUID: "optjob-uid",
+			wantCount: 0,
+			wantPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "other-uid", names: map[string]time.Time{"trial-1": now}},
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, ctx := ktesting.NewTestContext(t)
+			baseClient := utiltesting.NewClientBuilder().WithObjects(tc.objs...).Build()
+			var reader client.Reader = baseClient
+			if tc.readerErr != nil {
+				reader = interceptor.NewClient(baseClient, interceptor.Funcs{
+					Get: func(ctx context.Context, client client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+						return tc.readerErr
+					},
+				})
+			}
+			job := optJob.DeepCopy()
+			if tc.optJobUID != "" {
+				job.UID = tc.optJobUID
+			}
+			r := &OptimizationJobReconciler{
+				Client:        baseClient,
+				APIReader:     reader,
+				pendingTrials: tc.initPending,
+			}
+			gotCount, err := r.verifyPendingTrialCreations(ctx, job, tc.overdue)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("verifyPendingTrialCreations() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if gotCount != tc.wantCount {
+				t.Errorf("verifyPendingTrialCreations() count = %d, want %d", gotCount, tc.wantCount)
+			}
+			if diff := cmp.Diff(tc.wantPending, r.pendingTrials, cmp.AllowUnexported(trialCreationExpectations{})); len(diff) != 0 {
+				t.Errorf("Unexpected pendingTrials (-want, +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestClearTrialExpectations(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	key := types.NamespacedName{Namespace: "default", Name: "test-optjob"}
+	otherKey := types.NamespacedName{Namespace: "default", Name: "other-optjob"}
+
+	cases := map[string]struct {
+		initPending map[types.NamespacedName]*trialCreationExpectations
+		key         types.NamespacedName
+		wantPending map[types.NamespacedName]*trialCreationExpectations
+	}{
+		"clear existing key removes entry from map": {
+			initPending: map[types.NamespacedName]*trialCreationExpectations{
+				key:      {uid: "uid-1", names: map[string]time.Time{"trial-1": now}},
+				otherKey: {uid: "uid-2", names: map[string]time.Time{"other-trial": now}},
+			},
+			key: key,
+			wantPending: map[types.NamespacedName]*trialCreationExpectations{
+				otherKey: {uid: "uid-2", names: map[string]time.Time{"other-trial": now}},
+			},
+		},
+		"clear nonexistent key is no-op": {
+			initPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "uid-1", names: map[string]time.Time{"trial-1": now}},
+			},
+			key: otherKey,
+			wantPending: map[types.NamespacedName]*trialCreationExpectations{
+				key: {uid: "uid-1", names: map[string]time.Time{"trial-1": now}},
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			r := &OptimizationJobReconciler{
+				pendingTrials: tc.initPending,
+			}
+			r.clearTrialExpectations(tc.key)
+			if diff := cmp.Diff(tc.wantPending, r.pendingTrials, cmp.AllowUnexported(trialCreationExpectations{})); len(diff) != 0 {
+				t.Errorf("Unexpected pendingTrials (-want, +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestGetAlgorithmServiceName(t *testing.T) {
+	// Standard name
+	job := &trainer.OptimizationJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-optjob"},
+	}
+	svcName := optimizationjob.GetAlgorithmServiceName(job)
+	if svcName != "my-optjob-search-algorithm" {
+		t.Errorf("expected my-optjob-search-algorithm, got %q", svcName)
+	}
+
+	// Very long name should be truncated so total length <= 63
+	longJob := &trainer.OptimizationJob{
+		ObjectMeta: metav1.ObjectMeta{Name: strings.Repeat("x", 60)},
+	}
+	longSvcName := optimizationjob.GetAlgorithmServiceName(longJob)
+	if len(longSvcName) > 63 {
+		t.Errorf("GetAlgorithmServiceName should not exceed 63 characters, got length %d: %q", len(longSvcName), longSvcName)
+	}
+}
+
+func TestExtractBestResult(t *testing.T) {
+	tests := []struct {
+		name       string
+		optJob     *trainer.OptimizationJob
+		trainJobs  []trainer.TrainJob
+		wantResult *trainer.Result
+	}{
+		{
+			name: "no objectives returns nil",
+			optJob: &trainer.OptimizationJob{
+				Spec: trainer.OptimizationJobSpec{},
+			},
+			trainJobs: []trainer.TrainJob{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "tj-1"},
+					Status: trainer.TrainJobStatus{
+						Conditions: []metav1.Condition{
+							{Type: trainer.TrainJobComplete, Status: metav1.ConditionTrue},
+						},
+						TrainerStatus: &trainer.TrainerStatus{
+							Metrics: []trainer.Metric{{Name: "accuracy", Value: "0.9"}},
+						},
+					},
+				},
+			},
+			wantResult: nil,
+		},
+		{
+			name: "maximize chooses highest metric value",
+			optJob: &trainer.OptimizationJob{
+				Spec: trainer.OptimizationJobSpec{
+					Objectives: []trainer.Objective{
+						{Metric: "accuracy", Direction: trainer.ObjectiveDirectionMaximize},
+					},
+				},
+			},
+			trainJobs: []trainer.TrainJob{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "tj-low"},
+					Spec: trainer.TrainJobSpec{
+						Trainer: &trainer.Trainer{
+							Env: []corev1.EnvVar{
+								{Name: constants.EnvVarPrefix + "lr", Value: "0.001"},
+							},
+						},
+					},
+					Status: trainer.TrainJobStatus{
+						Conditions: []metav1.Condition{
+							{Type: trainer.TrainJobComplete, Status: metav1.ConditionTrue},
+						},
+						TrainerStatus: &trainer.TrainerStatus{
+							Metrics: []trainer.Metric{{Name: "accuracy", Value: "0.75"}},
+						},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "tj-high"},
+					Spec: trainer.TrainJobSpec{
+						Trainer: &trainer.Trainer{
+							Env: []corev1.EnvVar{
+								{Name: constants.EnvVarPrefix + "lr", Value: "0.01"},
+								{Name: constants.EnvVarPrefix + "epochs", Value: "10"},
+							},
+						},
+					},
+					Status: trainer.TrainJobStatus{
+						Conditions: []metav1.Condition{
+							{Type: trainer.TrainJobComplete, Status: metav1.ConditionTrue},
+						},
+						TrainerStatus: &trainer.TrainerStatus{
+							Metrics: []trainer.Metric{{Name: "accuracy", Value: "0.95"}},
+						},
+					},
+				},
+			},
+			wantResult: &trainer.Result{
+				TrainJobName: "tj-high",
+				Parameters: []trainer.ParameterAssignment{
+					{Name: "epochs", Value: "10"},
+					{Name: "lr", Value: "0.01"},
+				},
+			},
+		},
+		{
+			name: "minimize chooses lowest metric value",
+			optJob: &trainer.OptimizationJob{
+				Spec: trainer.OptimizationJobSpec{
+					Objectives: []trainer.Objective{
+						{Metric: "loss", Direction: trainer.ObjectiveDirectionMinimize},
+					},
+				},
+			},
+			trainJobs: []trainer.TrainJob{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "tj-high-loss"},
+					Spec: trainer.TrainJobSpec{
+						Trainer: &trainer.Trainer{
+							Env: []corev1.EnvVar{
+								{Name: constants.EnvVarPrefix + "lr", Value: "0.1"},
+							},
+						},
+					},
+					Status: trainer.TrainJobStatus{
+						Conditions: []metav1.Condition{
+							{Type: trainer.TrainJobComplete, Status: metav1.ConditionTrue},
+						},
+						TrainerStatus: &trainer.TrainerStatus{
+							Metrics: []trainer.Metric{{Name: "loss", Value: "1.23"}},
+						},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "tj-low-loss"},
+					Spec: trainer.TrainJobSpec{
+						Trainer: &trainer.Trainer{
+							Env: []corev1.EnvVar{
+								{Name: constants.EnvVarPrefix + "lr", Value: "0.01"},
+							},
+						},
+					},
+					Status: trainer.TrainJobStatus{
+						Conditions: []metav1.Condition{
+							{Type: trainer.TrainJobComplete, Status: metav1.ConditionTrue},
+						},
+						TrainerStatus: &trainer.TrainerStatus{
+							Metrics: []trainer.Metric{{Name: "loss", Value: "0.12"}},
+						},
+					},
+				},
+			},
+			wantResult: &trainer.Result{
+				TrainJobName: "tj-low-loss",
+				Parameters: []trainer.ParameterAssignment{
+					{Name: "lr", Value: "0.01"},
+				},
+			},
+		},
+		{
+			name: "metric value NaN is skipped",
+			optJob: &trainer.OptimizationJob{
+				Spec: trainer.OptimizationJobSpec{
+					Objectives: []trainer.Objective{
+						{Metric: "accuracy", Direction: trainer.ObjectiveDirectionMaximize},
+					},
+				},
+			},
+			trainJobs: []trainer.TrainJob{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "tj-nan"},
+					Spec: trainer.TrainJobSpec{
+						Trainer: &trainer.Trainer{
+							Env: []corev1.EnvVar{
+								{Name: constants.EnvVarPrefix + "lr", Value: "0.1"},
+							},
+						},
+					},
+					Status: trainer.TrainJobStatus{
+						Conditions: []metav1.Condition{
+							{Type: trainer.TrainJobComplete, Status: metav1.ConditionTrue},
+						},
+						TrainerStatus: &trainer.TrainerStatus{
+							Metrics: []trainer.Metric{{Name: "accuracy", Value: "NaN"}},
+						},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "tj-valid"},
+					Spec: trainer.TrainJobSpec{
+						Trainer: &trainer.Trainer{
+							Env: []corev1.EnvVar{
+								{Name: constants.EnvVarPrefix + "lr", Value: "0.01"},
+							},
+						},
+					},
+					Status: trainer.TrainJobStatus{
+						Conditions: []metav1.Condition{
+							{Type: trainer.TrainJobComplete, Status: metav1.ConditionTrue},
+						},
+						TrainerStatus: &trainer.TrainerStatus{
+							Metrics: []trainer.Metric{{Name: "accuracy", Value: "0.85"}},
+						},
+					},
+				},
+			},
+			wantResult: &trainer.Result{
+				TrainJobName: "tj-valid",
+				Parameters: []trainer.ParameterAssignment{
+					{Name: "lr", Value: "0.01"},
+				},
+			},
+		},
+		{
+			name: "per-epoch history picks final metric value",
+			optJob: &trainer.OptimizationJob{
+				Spec: trainer.OptimizationJobSpec{
+					Objectives: []trainer.Objective{
+						{Metric: "accuracy", Direction: trainer.ObjectiveDirectionMaximize},
+					},
+				},
+			},
+			trainJobs: []trainer.TrainJob{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "tj-1"},
+					Spec: trainer.TrainJobSpec{
+						Trainer: &trainer.Trainer{
+							Env: []corev1.EnvVar{
+								{Name: constants.EnvVarPrefix + "lr", Value: "0.01"},
+							},
+						},
+					},
+					Status: trainer.TrainJobStatus{
+						Conditions: []metav1.Condition{
+							{Type: trainer.TrainJobComplete, Status: metav1.ConditionTrue},
+						},
+						TrainerStatus: &trainer.TrainerStatus{
+							Metrics: []trainer.Metric{
+								{Name: "accuracy", Value: "0.99"}, // initial spike
+								{Name: "accuracy", Value: "0.60"}, // final overfitted value
+							},
+						},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "tj-2"},
+					Spec: trainer.TrainJobSpec{
+						Trainer: &trainer.Trainer{
+							Env: []corev1.EnvVar{
+								{Name: constants.EnvVarPrefix + "lr", Value: "0.02"},
+							},
+						},
+					},
+					Status: trainer.TrainJobStatus{
+						Conditions: []metav1.Condition{
+							{Type: trainer.TrainJobComplete, Status: metav1.ConditionTrue},
+						},
+						TrainerStatus: &trainer.TrainerStatus{
+							Metrics: []trainer.Metric{
+								{Name: "accuracy", Value: "0.50"},
+								{Name: "accuracy", Value: "0.80"}, // final converged value
+							},
+						},
+					},
+				},
+			},
+			wantResult: &trainer.Result{
+				TrainJobName: "tj-2",
+				Parameters: []trainer.ParameterAssignment{
+					{Name: "lr", Value: "0.02"},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := optimizationjob.ExtractBestResult(tt.optJob, tt.trainJobs)
+			if diff := cmp.Diff(tt.wantResult, got); diff != "" {
+				t.Errorf("ExtractBestResult() mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestConstructTrainJob(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = trainer.AddToScheme(scheme)
+
+	r := &OptimizationJobReconciler{
+		Scheme: scheme,
+	}
+
+	optJob := &trainer.OptimizationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-optjob",
+			Namespace: "default",
+		},
+		Spec: trainer.OptimizationJobSpec{
+			TrainJobTemplate: trainer.TrainJobTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"custom-label": "custom-value",
+					},
+					Annotations: map[string]string{
+						"custom-annotation": "custom-annotation-value",
+					},
+				},
+				Spec: trainer.TrainJobSpec{
+					Trainer: &trainer.Trainer{},
+				},
+			},
+		},
+	}
+
+	params := []trainer.ParameterAssignment{
+		{Name: "lr", Value: "0.01"},
+	}
+
+	tj, err := r.constructTrainJob(optJob, params)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	expectedLabels := map[string]string{
+		"custom-label":                     "custom-value",
+		constants.OptimizationJobNameLabel: "test-optjob",
+	}
+	if diff := cmp.Diff(expectedLabels, tj.Labels); diff != "" {
+		t.Errorf("Labels mismatch (-want +got):\n%s", diff)
+	}
+
+	expectedAnnotations := map[string]string{
+		"custom-annotation": "custom-annotation-value",
+	}
+	if diff := cmp.Diff(expectedAnnotations, tj.Annotations); diff != "" {
+		t.Errorf("Annotations mismatch (-want +got):\n%s", diff)
+	}
+
+	// Test when TrainJobTemplate has nil Labels and Annotations
+	optJobNoLabels := &trainer.OptimizationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-optjob-nolabels",
+			Namespace: "default",
+		},
+		Spec: trainer.OptimizationJobSpec{
+			TrainJobTemplate: trainer.TrainJobTemplateSpec{
+				Spec: trainer.TrainJobSpec{
+					Trainer: &trainer.Trainer{},
+				},
+			},
+		},
+	}
+	tjNoLabels, err := r.constructTrainJob(optJobNoLabels, params)
+	if err != nil {
+		t.Fatalf("unexpected error with nil labels: %v", err)
+	}
+	expectedOnlyOptLabel := map[string]string{
+		constants.OptimizationJobNameLabel: "test-optjob-nolabels",
+	}
+	if diff := cmp.Diff(expectedOnlyOptLabel, tjNoLabels.Labels); diff != "" {
+		t.Errorf("Labels mismatch for nil labels (-want +got):\n%s", diff)
+	}
+}
+
+func TestConstructAlgorithmDeployment(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = trainer.AddToScheme(scheme)
+
+	r := &OptimizationJobReconciler{
+		Scheme: scheme,
+	}
+
+	optJob := &trainer.OptimizationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-optjob",
+			Namespace: "default",
+			UID:       types.UID("12345"),
+		},
+	}
+
+	deploy, err := r.constructAlgorithmDeployment(optJob)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	expectedName := "test-optjob-search-algorithm"
+	if deploy.Name != expectedName {
+		t.Errorf("expected deployment name %q, got %q", expectedName, deploy.Name)
+	}
+	if deploy.Namespace != "default" {
+		t.Errorf("expected namespace default, got %q", deploy.Namespace)
+	}
+	expectedLabels := map[string]string{
+		constants.OptimizationJobNameLabel:      "test-optjob",
+		constants.OptimizationJobComponentLabel: constants.SearchAlgorithmComponent,
+	}
+	if diff := cmp.Diff(expectedLabels, deploy.Labels); diff != "" {
+		t.Errorf("deployment labels mismatch (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff(expectedLabels, deploy.Spec.Selector.MatchLabels); diff != "" {
+		t.Errorf("deployment selector mismatch (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff(expectedLabels, deploy.Spec.Template.Labels); diff != "" {
+		t.Errorf("algorithm pod labels mismatch (-want +got):\n%s", diff)
+	}
+
+	if len(deploy.Spec.Template.Spec.Containers) != 1 {
+		t.Fatalf("expected 1 container, got %d", len(deploy.Spec.Template.Spec.Containers))
+	}
+	c := deploy.Spec.Template.Spec.Containers[0]
+	if c.Image != constants.DefaultSearchAlgorithmImage {
+		t.Errorf("expected image %q, got %q", constants.DefaultSearchAlgorithmImage, c.Image)
+	}
+	if c.ReadinessProbe == nil || c.ReadinessProbe.GRPC == nil {
+		t.Fatalf("expected gRPC readiness probe, got %v", c.ReadinessProbe)
+	}
+	if c.ReadinessProbe.GRPC.Port != constants.SearchAlgorithmServicePort {
+		t.Errorf("expected GRPC port %d, got %d", constants.SearchAlgorithmServicePort, c.ReadinessProbe.GRPC.Port)
+	}
+	if c.ReadinessProbe.GRPC.Service == nil || *c.ReadinessProbe.GRPC.Service != constants.SearchAlgorithmServiceName {
+		t.Errorf("expected GRPC service %q, got %v", constants.SearchAlgorithmServiceName, c.ReadinessProbe.GRPC.Service)
+	}
+	if c.ReadinessProbe.TCPSocket != nil {
+		t.Errorf("unexpected TCP readiness probe: %v", c.ReadinessProbe.TCPSocket)
+	}
+
+	controllerRef := metav1.GetControllerOf(deploy)
+	if controllerRef == nil || controllerRef.Name != "test-optjob" {
+		t.Errorf("expected controller reference to test-optjob, got %v", controllerRef)
+	}
+}
+
+func TestConstructAlgorithmService(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = trainer.AddToScheme(scheme)
+
+	r := &OptimizationJobReconciler{
+		Scheme: scheme,
+	}
+
+	optJob := &trainer.OptimizationJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-optjob",
+			Namespace: "default",
+			UID:       types.UID("12345"),
+		},
+	}
+
+	svc, err := r.constructAlgorithmService(optJob)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	expectedName := "test-optjob-search-algorithm"
+	if svc.Name != expectedName {
+		t.Errorf("expected service name %q, got %q", expectedName, svc.Name)
+	}
+	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != constants.SearchAlgorithmServicePort {
+		t.Errorf("expected service port %d, got %v", constants.SearchAlgorithmServicePort, svc.Spec.Ports)
+	}
+	expectedLabels := map[string]string{
+		constants.OptimizationJobNameLabel:      "test-optjob",
+		constants.OptimizationJobComponentLabel: constants.SearchAlgorithmComponent,
+	}
+	if diff := cmp.Diff(expectedLabels, svc.Spec.Selector); diff != "" {
+		t.Errorf("service selector mismatch (-want +got):\n%s", diff)
+	}
+
+	controllerRef := metav1.GetControllerOf(svc)
+	if controllerRef == nil || controllerRef.Name != "test-optjob" {
+		t.Errorf("expected controller reference to test-optjob, got %v", controllerRef)
+	}
+}

@@ -1,3 +1,17 @@
+// Copyright The Kubeflow Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Sample client for validating access to cached datasets in the Arrow-based caching system.
 //!
 //! This client demonstrates how to connect to the head node and stream cached data
@@ -108,5 +122,6 @@ async fn connect_to_host(
 ) -> Result<FlightServiceClient<Channel>, Box<dyn std::error::Error>> {
     let address = format!("{}", endpoint);
     info!("{}", address);
-    Ok(FlightServiceClient::connect(address).await?)
+    let channel = Channel::from_shared(address)?.connect().await?;
+    Ok(FlightServiceClient::new(channel))
 }

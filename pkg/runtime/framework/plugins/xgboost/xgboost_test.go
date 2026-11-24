@@ -88,6 +88,32 @@ func TestXGBoostValidate(t *testing.T) {
 			),
 			trainJob: utiltesting.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").Obj(),
 		},
+		"trainer replicatedJob with multiple replicas is not supported": {
+			runtimeInfo: runtime.NewInfo(
+				runtime.WithMLPolicySource(
+					utiltesting.MakeMLPolicyWrapper().
+						WithMLPolicySource(*utiltesting.MakeMLPolicySourceWrapper().
+							XGBoostPolicy().
+							Obj(),
+						).
+						Obj(),
+				),
+				runtime.WithTemplateSpecObjApply(jobsetv1alpha2ac.JobSetSpec().
+					WithReplicatedJobs(jobsetv1alpha2ac.ReplicatedJob().
+						WithName(constants.Node).
+						WithReplicas(2).
+						WithTemplate(batchv1ac.JobTemplateSpec().
+							WithLabels(map[string]string{constants.LabelTrainJobAncestor: constants.AncestorTrainer}),
+						),
+					),
+				),
+			),
+			trainJob: utiltesting.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").Obj(),
+			wantErrs: field.ErrorList{
+				field.Invalid(field.NewPath("spec", "runtimeRef"), int32(2),
+					"trainer replicatedJob replicas must be 1 for the XGBoost runtime"),
+			},
+		},
 		"no error when env does not contain reserved names": {
 			runtimeInfo: runtime.NewInfo(
 				runtime.WithMLPolicySource(
@@ -243,7 +269,7 @@ func TestXGBoostEnforceMLPolicy(t *testing.T) {
 				),
 			),
 		},
-		"no env injection when trainJob.Spec.Trainer is nil": {
+		"trainer is nil - DMLC envs come from the runtime": {
 			info: runtime.NewInfo(
 				runtime.WithMLPolicySource(
 					utiltesting.MakeMLPolicyWrapper().
@@ -274,8 +300,141 @@ func TestXGBoostEnforceMLPolicy(t *testing.T) {
 						SinglePodRequests: make(corev1.ResourceList),
 						Containers: []runtime.Container{{
 							Name: constants.Node,
+							Ports: []corev1ac.ContainerPortApplyConfiguration{{
+								ContainerPort: ptr.To[int32](constants.ContainerTrainerPort),
+							}},
+							Env: []corev1ac.EnvVarApplyConfiguration{
+								{
+									Name:  ptr.To(constants.XGBoostEnvTrackerURI),
+									Value: ptr.To(fmt.Sprintf("test-job-%s-0-0.test-job", constants.Node)),
+								},
+								{
+									Name:  ptr.To(constants.XGBoostEnvTrackerPort),
+									Value: ptr.To(fmt.Sprintf("%d", constants.ContainerTrainerPort)),
+								},
+								{
+									Name: ptr.To(constants.XGBoostEnvTaskID),
+									ValueFrom: &corev1ac.EnvVarSourceApplyConfiguration{
+										FieldRef: &corev1ac.ObjectFieldSelectorApplyConfiguration{
+											FieldPath: ptr.To(constants.JobCompletionIndexFieldPath),
+										},
+									},
+								},
+								{
+									Name:  ptr.To(constants.XGBoostEnvNumWorker),
+									Value: ptr.To("1"),
+								},
+							},
 						}},
 					}},
+				},
+				Scheduler: &runtime.Scheduler{PodLabels: make(map[string]string)},
+			},
+		},
+		"trainer is nil - DMLC_NUM_WORKER uses the GPUs in the runtime": {
+			info: runtime.NewInfo(
+				runtime.WithMLPolicySource(
+					utiltesting.MakeMLPolicyWrapper().
+						WithMLPolicySource(*utiltesting.MakeMLPolicySourceWrapper().
+							XGBoostPolicy().
+							Obj(),
+						).
+						Obj(),
+				),
+				runtime.WithPodSet(constants.Node, ptr.To(constants.AncestorTrainer), 2, corev1.PodSpec{}, corev1ac.PodSpec().
+					WithContainers(corev1ac.Container().WithName(constants.Node)),
+				),
+				runtime.WithTemplateSpecObjApply(
+					jobsetv1alpha2ac.JobSetSpec().
+						WithReplicatedJobs(
+							jobsetv1alpha2ac.ReplicatedJob().
+								WithName(constants.Node).
+								WithTemplate(batchv1ac.JobTemplateSpec().
+									WithSpec(batchv1ac.JobSpec().
+										WithTemplate(corev1ac.PodTemplateSpec().
+											WithSpec(corev1ac.PodSpec().
+												WithContainers(
+													corev1ac.Container().
+														WithName(constants.Node).
+														WithResources(corev1ac.ResourceRequirements().
+															WithRequests(corev1.ResourceList{
+																"example.com/gpu": resource.MustParse("2"),
+															}),
+														),
+												),
+											),
+										),
+									),
+								),
+						),
+				),
+			),
+			trainJob: utiltesting.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").Obj(),
+			wantInfo: &runtime.Info{
+				Labels:      make(map[string]string),
+				Annotations: make(map[string]string),
+				RuntimePolicy: runtime.RuntimePolicy{
+					MLPolicySource: utiltesting.MakeMLPolicySourceWrapper().
+						XGBoostPolicy().
+						Obj(),
+				},
+				TemplateSpec: runtime.TemplateSpec{
+					PodSets: []runtime.PodSet{{
+						Name:              constants.Node,
+						Ancestor:          ptr.To(constants.AncestorTrainer),
+						Count:             ptr.To[int32](2),
+						SinglePodRequests: make(corev1.ResourceList),
+						Containers: []runtime.Container{{
+							Name: constants.Node,
+							Ports: []corev1ac.ContainerPortApplyConfiguration{{
+								ContainerPort: ptr.To[int32](constants.ContainerTrainerPort),
+							}},
+							Env: []corev1ac.EnvVarApplyConfiguration{
+								{
+									Name:  ptr.To(constants.XGBoostEnvTrackerURI),
+									Value: ptr.To(fmt.Sprintf("test-job-%s-0-0.test-job", constants.Node)),
+								},
+								{
+									Name:  ptr.To(constants.XGBoostEnvTrackerPort),
+									Value: ptr.To(fmt.Sprintf("%d", constants.ContainerTrainerPort)),
+								},
+								{
+									Name: ptr.To(constants.XGBoostEnvTaskID),
+									ValueFrom: &corev1ac.EnvVarSourceApplyConfiguration{
+										FieldRef: &corev1ac.ObjectFieldSelectorApplyConfiguration{
+											FieldPath: ptr.To(constants.JobCompletionIndexFieldPath),
+										},
+									},
+								},
+								{
+									Name:  ptr.To(constants.XGBoostEnvNumWorker),
+									Value: ptr.To("4"),
+								},
+							},
+						}},
+					}},
+					ObjApply: jobsetv1alpha2ac.JobSetSpec().
+						WithReplicatedJobs(
+							jobsetv1alpha2ac.ReplicatedJob().
+								WithName(constants.Node).
+								WithTemplate(batchv1ac.JobTemplateSpec().
+									WithSpec(batchv1ac.JobSpec().
+										WithTemplate(corev1ac.PodTemplateSpec().
+											WithSpec(corev1ac.PodSpec().
+												WithContainers(
+													corev1ac.Container().
+														WithName(constants.Node).
+														WithResources(corev1ac.ResourceRequirements().
+															WithRequests(corev1.ResourceList{
+																"example.com/gpu": resource.MustParse("2"),
+															}),
+														),
+												),
+											),
+										),
+									),
+								),
+						),
 				},
 				Scheduler: &runtime.Scheduler{PodLabels: make(map[string]string)},
 			},
@@ -425,7 +584,7 @@ func TestXGBoostEnforceMLPolicy(t *testing.T) {
 						Obj(),
 				),
 				runtime.WithPodSet(constants.Node, ptr.To(constants.AncestorTrainer), 1, corev1.PodSpec{}, corev1ac.PodSpec().
-					WithContainers(corev1ac.Container().WithName(constants.Node)),
+					WithContainers(corev1ac.Container().WithName(constants.Node).WithImage("test:runtime")),
 				),
 			),
 			trainJob: utiltesting.MakeTrainJobWrapper(metav1.NamespaceDefault, "gpu-job").
@@ -455,7 +614,8 @@ func TestXGBoostEnforceMLPolicy(t *testing.T) {
 						Count:             ptr.To[int32](2),
 						SinglePodRequests: make(corev1.ResourceList),
 						Containers: []runtime.Container{{
-							Name: constants.Node,
+							Name:  constants.Node,
+							Image: "xgboost/xgboost:latest",
 							Ports: []corev1ac.ContainerPortApplyConfiguration{{
 								ContainerPort: ptr.To(constants.ContainerTrainerPort),
 							}},
@@ -773,7 +933,8 @@ func TestXGBoostEnforceMLPolicy(t *testing.T) {
 						Count:             ptr.To[int32](2),
 						SinglePodRequests: make(corev1.ResourceList),
 						Containers: []runtime.Container{{
-							Name: constants.Node,
+							Name:  constants.Node,
+							Image: "xgboost/xgboost:latest",
 							Ports: []corev1ac.ContainerPortApplyConfiguration{{
 								ContainerPort: ptr.To(constants.ContainerTrainerPort),
 							}},
@@ -868,7 +1029,8 @@ func TestXGBoostEnforceMLPolicy(t *testing.T) {
 						Count:             ptr.To[int32](2),
 						SinglePodRequests: make(corev1.ResourceList),
 						Containers: []runtime.Container{{
-							Name: constants.Node,
+							Name:  constants.Node,
+							Image: "xgboost/xgboost:latest",
 							Ports: []corev1ac.ContainerPortApplyConfiguration{{
 								ContainerPort: ptr.To(constants.ContainerTrainerPort),
 							}},

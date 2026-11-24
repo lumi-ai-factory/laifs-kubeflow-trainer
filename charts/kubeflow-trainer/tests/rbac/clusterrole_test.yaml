@@ -1,18 +1,16 @@
-#
-# Copyright 2025 The Kubeflow authors.
+# Copyright 2025 The Kubeflow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     https://www.apache.org/licenses/LICENSE-2.0
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
 
 suite: Test manager ClusterRole
 
@@ -30,3 +28,89 @@ tests:
           apiVersion: rbac.authorization.k8s.io/v1
           kind: ClusterRole
           name: kubeflow-trainer-controller-manager
+      # The manager only creates TrainJobs (from the OptimizationJob controller), so
+      # `create` must not leak onto the runtime and OptimizationJob resources.
+      # The rules are generated from manifests/base/rbac/role.yaml by `make manifests`.
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - trainer.kubeflow.org
+            resources:
+              - clustertrainingruntimes
+              - optimizationjobs
+              - trainingruntimes
+            verbs:
+              - get
+              - list
+              - patch
+              - update
+              - watch
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - trainer.kubeflow.org
+            resources:
+              - trainjobs
+            verbs:
+              - create
+              - get
+              - list
+              - patch
+              - update
+              - watch
+      - notContains:
+          path: rules
+          content:
+            apiGroups:
+              - trainer.kubeflow.org
+            resources:
+              - clustertrainingruntimes
+              - optimizationjobs
+              - trainingruntimes
+              - trainjobs
+            verbs:
+              - create
+              - get
+              - list
+              - patch
+              - update
+              - watch
+
+  - it: Should allow managing Workload-Aware Scheduling objects
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - scheduling.k8s.io
+            resources:
+              - podgroups
+              - workloads
+            verbs:
+              - create
+              - delete
+              - get
+              - list
+              - patch
+              - watch
+
+  - it: Should allow metrics authentication reviews
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - authentication.k8s.io
+            resources:
+              - tokenreviews
+            verbs: ["create"]
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - authorization.k8s.io
+            resources:
+              - subjectaccessreviews
+            verbs: ["create"]

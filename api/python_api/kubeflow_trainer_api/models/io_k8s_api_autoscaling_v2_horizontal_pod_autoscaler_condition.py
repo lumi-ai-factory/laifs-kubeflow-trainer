@@ -1,3 +1,17 @@
+# Copyright The Kubeflow Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # coding: utf-8
 
 """
@@ -18,7 +32,7 @@ import re  # noqa: F401
 import json
 
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict, Field, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
 from typing import Any, ClassVar, Dict, List, Optional
 from typing import Optional, Set
 from typing_extensions import Self
@@ -29,10 +43,11 @@ class IoK8sApiAutoscalingV2HorizontalPodAutoscalerCondition(BaseModel):
     """ # noqa: E501
     last_transition_time: Optional[datetime] = Field(default=None, description="lastTransitionTime is the last time the condition transitioned from one status to another", alias="lastTransitionTime")
     message: Optional[StrictStr] = Field(default=None, description="message is a human-readable explanation containing details about the transition")
+    observed_generation: Optional[StrictInt] = Field(default=None, description="observedGeneration represents the .metadata.generation that the condition was set based upon. For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date with respect to the current state of the instance.", alias="observedGeneration")
     reason: Optional[StrictStr] = Field(default=None, description="reason is the reason for the condition's last transition.")
     status: StrictStr = Field(description="status is the status of the condition (True, False, Unknown)")
     type: StrictStr = Field(description="type describes the current condition")
-    __properties: ClassVar[List[str]] = ["lastTransitionTime", "message", "reason", "status", "type"]
+    __properties: ClassVar[List[str]] = ["lastTransitionTime", "message", "observedGeneration", "reason", "status", "type"]
 
     model_config = ConfigDict(
         populate_by_name=True,
@@ -87,6 +102,7 @@ class IoK8sApiAutoscalingV2HorizontalPodAutoscalerCondition(BaseModel):
         _obj = cls.model_validate({
             "lastTransitionTime": obj.get("lastTransitionTime"),
             "message": obj.get("message"),
+            "observedGeneration": obj.get("observedGeneration"),
             "reason": obj.get("reason"),
             "status": obj.get("status") if obj.get("status") is not None else '',
             "type": obj.get("type") if obj.get("type") is not None else ''

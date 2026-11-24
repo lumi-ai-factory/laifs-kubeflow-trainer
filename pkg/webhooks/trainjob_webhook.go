@@ -24,13 +24,16 @@ import (
 	admissionv1 "k8s.io/api/admission/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	trainer "github.com/kubeflow/trainer/v2/pkg/apis/trainer/v1alpha1"
+	"github.com/kubeflow/trainer/v2/pkg/features"
 	"github.com/kubeflow/trainer/v2/pkg/runtime"
+	"github.com/kubeflow/trainer/v2/pkg/util/trainjob"
 )
 
 // +kubebuilder:webhook:path=/mutate-trainer-kubeflow-org-v1alpha1-trainjob,mutating=true,failurePolicy=fail,sideEffects=None,groups=trainer.kubeflow.org,resources=trainjobs,verbs=create;update,versions=v1alpha1,name=defaulter.trainjob.trainer.kubeflow.org,admissionReviewVersions=v1
@@ -111,6 +114,10 @@ func (w *TrainJobValidator) ValidateCreate(ctx context.Context, obj *trainer.Tra
 	log := ctrl.LoggerFrom(ctx).WithName("trainJob-webhook")
 	log.V(5).Info("Validating create", "TrainJob", klog.KObj(obj))
 
+	if !features.Enabled(features.TrainJobDynamicResourceAllocation) && usesDRA(obj) {
+		return nil, draFieldPaths(obj).ToAggregate()
+	}
+
 	runtimeRefGK := runtime.RuntimeRefToRuntimeRegistryKey(obj.Spec.RuntimeRef)
 	runtime, ok := w.runtimes[runtimeRefGK]
 	if !ok {
@@ -124,6 +131,13 @@ func (w *TrainJobValidator) ValidateUpdate(ctx context.Context, oldObj, newObj *
 	log := ctrl.LoggerFrom(ctx).WithName("trainJob-webhook")
 	log.V(5).Info("Validating update", "TrainJob", klog.KObj(newObj))
 
+	// spec.trainer is immutable, but spec.runtimePatches entries can still be appended on update,
+	// so only reject an update that introduces DRA fields; a TrainJob created with them while the
+	// gate was enabled stays updatable (e.g. suspend) after the gate is disabled.
+	if !features.Enabled(features.TrainJobDynamicResourceAllocation) && usesDRA(newObj) && !usesDRA(oldObj) {
+		return nil, draFieldPaths(newObj).ToAggregate()
+	}
+
 	runtimeRefGK := runtime.RuntimeRefToRuntimeRegistryKey(newObj.Spec.RuntimeRef)
 	runtime, ok := w.runtimes[runtimeRefGK]
 	if !ok {
@@ -135,4 +149,19 @@ func (w *TrainJobValidator) ValidateUpdate(ctx context.Context, oldObj, newObj *
 
 func (w *TrainJobValidator) ValidateDelete(ctx context.Context, obj *trainer.TrainJob) (admission.Warnings, error) {
 	return nil, nil
+}
+
+// usesDRA reports whether the TrainJob references any DRA fields.
+func usesDRA(trainJob *trainer.TrainJob) bool {
+	return len(trainjob.ResourceClaimsPaths(trainJob)) > 0 || len(trainjob.ContainerResourceClaimsPaths(trainJob)) > 0
+}
+
+// draFieldPaths returns field.Forbidden errors for every DRA field set on the TrainJob.
+func draFieldPaths(trainJob *trainer.TrainJob) field.ErrorList {
+	var allErrs field.ErrorList
+	msg := "TrainJobDynamicResourceAllocation feature gate is disabled"
+	for _, path := range append(trainjob.ResourceClaimsPaths(trainJob), trainjob.ContainerResourceClaimsPaths(trainJob)...) {
+		allErrs = append(allErrs, field.Forbidden(path, msg))
+	}
+	return allErrs
 }

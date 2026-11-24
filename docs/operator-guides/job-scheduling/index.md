@@ -1,0 +1,66 @@
+# Job Scheduling
+
+Configure gang scheduling and integrate Kubeflow Trainer with Kubernetes schedulers.
+
+----
+
+:::::{grid} 1 1 2 2
+:gutter: 3
+
+::::{grid-item-card} Overview
+:link: overview
+:link-type: doc
+
+Supported scheduling integrations and the PodGroupPolicy API
+::::
+
+::::{grid-item-card} Kueue
+:link: https://kueue.sigs.k8s.io/docs/tasks/run/trainjobs/
+:link-type: url
+
+Job queueing and resource management with Kueue
+::::
+
+::::{grid-item-card} Slurm Bridge
+:link: slurm-bridge
+:link-type: doc
+
+Schedule TrainJobs on hybrid Kubernetes and Slurm clusters
+::::
+
+::::{grid-item-card} KAI Scheduler
+:link: kai
+:link-type: doc
+
+Gang scheduling with NVIDIA KAI Scheduler
+::::
+
+::::{grid-item-card} Coscheduling
+:link: coscheduling
+:link-type: doc
+
+Gang scheduling with the Coscheduling plugin
+::::
+
+::::{grid-item-card} Volcano Scheduler
+:link: volcano
+:link-type: doc
+
+Advanced batch scheduling with Volcano
+::::
+
+:::::
+
+----
+
+```{toctree}
+:hidden:
+:maxdepth: 1
+
+overview
+Kueue <https://kueue.sigs.k8s.io/docs/tasks/run/trainjobs/>
+slurm-bridge
+kai
+coscheduling
+volcano
+```

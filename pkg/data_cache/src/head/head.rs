@@ -1,6 +1,20 @@
+// Copyright The Kubeflow Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use crate::config::config::CacheConfig;
-use crate::head::provider::DataFileTableProvider;
-use crate::head::writer::DistributedWriterExec;
+use crate::head::provider::{DataFileTableProvider, empty_assignment};
+use crate::head::writer::{DistributedWriterExec, ExecutorClient};
 use arrow::array::UInt64Array;
 use arrow_schema::SchemaRef;
 use datafusion::datasource::MemTable;
@@ -11,7 +25,7 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -154,6 +168,55 @@ impl Distributor {
         let _ = execute_stream(Arc::new(plan), self.ctx.task_ctx())?
             .collect::<Vec<_>>()
             .await;
+        self.assign_empty_partitions().await?;
+        Ok(())
+    }
+
+    /// Sends an empty assignment to every worker that was given no data files.
+    ///
+    /// `DistributedWriterExec` (via `send_record_batch`) routes each assignment by
+    /// the `worker_ids` column of the batch that carries it, so a worker that holds
+    /// no data files is never a destination. Such a worker never handles a `do_put`,
+    /// never registers its memtable and therefore fails its readiness probe for the
+    /// lifetime of the pod, which keeps the LeaderWorkerSet from ever becoming
+    /// available. Telling it explicitly that it owns nothing lets it register an
+    /// empty memtable and report ready.
+    async fn assign_empty_partitions(&self) -> Result<()> {
+        let batches = self
+            .ctx
+            .sql(&format!("SELECT worker_ids FROM {}", self.mem_table_name))
+            .await?
+            .collect()
+            .await?;
+
+        let mut assigned: HashSet<u64> = HashSet::new();
+        for batch in &batches {
+            let worker_ids = batch
+                .column_by_name("worker_ids")
+                .ok_or_else(|| {
+                    DataFusionError::Execution("worker_ids column not found".to_string())
+                })?
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution("Failed to downcast to UInt64Array".to_string())
+                })?;
+            assigned.extend(worker_ids.values().iter().copied());
+        }
+
+        for worker_id in 0..self.num_workers as u64 {
+            if assigned.contains(&worker_id) {
+                continue;
+            }
+            info!("Worker {worker_id} was assigned no data files, sending empty assignment");
+
+            let addr = self.worker_map.get(&worker_id.to_string()).ok_or_else(|| {
+                DataFusionError::Execution(format!("Worker {} not found in worker map", worker_id))
+            })?;
+            let batch = empty_assignment(worker_id, self.total_row_count)?;
+            let mut client = ExecutorClient::try_new(addr, self.config.connect_timeout).await?;
+            client.send_batch(batch.schema(), vec![Ok(batch)]).await?;
+        }
         Ok(())
     }
 }
