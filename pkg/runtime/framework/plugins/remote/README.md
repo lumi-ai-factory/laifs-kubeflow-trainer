@@ -71,15 +71,26 @@ spec:
 
 | Source | Variables |
 |---|---|
-| Secret named in the `credentials` annotation | `FIRECREST_URL`, `FIRECREST_TOKEN`, `FIRECREST_MACHINE`, `FIRECREST_REMOTE_PATH`, `FIRECREST_ACCOUNT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `S3_ENDPOINT_URL`, `S3_REGION` |
+| Secret named in the `credentials` annotation | `FIRECREST_URL`, `FIRECREST_MACHINE`, `FIRECREST_REMOTE_PATH`, `FIRECREST_ACCOUNT`, FirecREST auth (see below), `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `S3_ENDPOINT_URL`, `S3_REGION` |
 | `mlflow-client` ConfigMap (optional) | `MLFLOW_TRACKING_URI` |
 
 ### Credentials
 
 Each job names its credential Secret with the `credentials` annotation, and the plugin adds that Secret from the
-TrainJob's namespace to the runner. The job runs on HPC as the owner of its FirecREST token. A credential Secret
-belongs to one user (e.g. `lumi-jane-doe-example-org`) or, later, to a robot account (`lumi-robot`). Only names
+TrainJob's namespace to the runner. The job runs on HPC as the owner of its FirecREST credentials. A credential Secret
+belongs to one user (e.g. `lumi-jane-doe-example-org`) or to a robot account (`lumi-robot`). Only names
 starting with `lumi-` are accepted. There is no default: without the annotation the TrainJob does not start.
+
+The Secret holds one of two FirecREST auth methods:
+
+| Method | Keys | Notes |
+|---|---|---|
+| Robot account (preferred) | `FIRECREST_CLIENT_ID`, `FIRECREST_CLIENT_SECRET` | Robot username and password. The runner gets a new token from the CSC IdP whenever the old one is about to expire. |
+| Personal token | `FIRECREST_TOKEN` | 24 h token from the FirecREST API; must be replaced when it expires. |
+
+If both are set, the robot account is used and `FIRECREST_TOKEN` is ignored with a warning. If only one of the robot
+keys is set, or neither method is set, the runner exits with an error. On LUMI a robot account's default SLURM
+account is `default_no_jobs`, so `FIRECREST_ACCOUNT` must name the project (e.g. `project_<number>`).
 
 ### MLflow (optional)
 

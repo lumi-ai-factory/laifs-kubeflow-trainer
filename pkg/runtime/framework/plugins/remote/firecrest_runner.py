@@ -40,7 +40,6 @@ def require_env(name: str) -> str:
 def collect_firecrest_env():
     keys = [
         "FIRECREST_URL",
-        "FIRECREST_TOKEN",
         "FIRECREST_MACHINE",
         "FIRECREST_REMOTE_PATH",
         "FIRECREST_ACCOUNT",
@@ -54,8 +53,35 @@ def collect_firecrest_env():
         env_vars[key] = value.strip()
     return env_vars
 
+CSC_TOKEN_URL = "https://user-auth.csc.fi/idp/profile/oidc/token"
+
+def create_firecrest_auth():
+    """Robot account if FIRECREST_CLIENT_ID and FIRECREST_CLIENT_SECRET are set, otherwise FIRECREST_TOKEN."""
+    token = os.environ.get("FIRECREST_TOKEN", "").strip()
+    client_id = os.environ.get("FIRECREST_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("FIRECREST_CLIENT_SECRET", "").strip()
+
+    if client_id and client_secret:
+        if token:
+            print("WARNING: robot account is set, ignoring FIRECREST_TOKEN")
+        print(f"FirecREST auth: robot account {client_id}")
+        # Gets a new token whenever the old one is about to expire
+        return fc.ClientCredentialsAuth(client_id, client_secret, CSC_TOKEN_URL)
+
+    if client_id or client_secret:
+        print("ERROR: robot account needs both FIRECREST_CLIENT_ID and FIRECREST_CLIENT_SECRET", file=sys.stderr)
+        sys.exit(1)
+
+    if token:
+        print("FirecREST auth: personal token")
+        return StaticTokenAuth(token)
+
+    print("ERROR: missing FirecREST credentials: set FIRECREST_CLIENT_ID and FIRECREST_CLIENT_SECRET, "
+          "or FIRECREST_TOKEN", file=sys.stderr)
+    sys.exit(1)
+
 def create_firecrest_client(fc_env):
-    auth = StaticTokenAuth(fc_env["FIRECREST_TOKEN"])
+    auth = create_firecrest_auth()
     client = fc.v2.Firecrest(
         firecrest_url=fc_env["FIRECREST_URL"],
         authorization=auth,
