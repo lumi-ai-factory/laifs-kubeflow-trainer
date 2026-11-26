@@ -338,3 +338,53 @@ func TestCredentialsSecret(t *testing.T) {
 		})
 	}
 }
+
+// Ensures the webhook rejects a new remote job with missing or invalid annotations,
+// so the user gets the error from TrainerClient().train() right away.
+func TestValidate(t *testing.T) {
+	r := getRemotePlugin(t)
+
+	credentialsField := "metadata.annotations[" + CredentialsAnnotation + "]"
+	slurmField := "metadata.annotations[" + SlurmURIAnnotation + "]"
+	valid := map[string]string{
+		CredentialsAnnotation: "lumi-robot",
+		SlurmURIAnnotation:    "s3://bucket/slurm_script.sh",
+	}
+
+	cases := map[string]struct {
+		runtime     string
+		annotations map[string]string
+		update      bool
+		wantFields  []string
+	}{
+		"valid job":             {runtime: Name, annotations: valid},
+		"credentials with key":  {runtime: Name, annotations: map[string]string{CredentialsAnnotation: "credentials: lumi-robot", SlurmURIAnnotation: "s3://bucket/slurm_script.sh"}, wantFields: []string{credentialsField}},
+		"credentials missing":   {runtime: Name, annotations: map[string]string{SlurmURIAnnotation: "s3://bucket/slurm_script.sh"}, wantFields: []string{credentialsField}},
+		"slurm-uri missing":     {runtime: Name, annotations: map[string]string{CredentialsAnnotation: "lumi-robot"}, wantFields: []string{slurmField}},
+		"no annotations":        {runtime: Name, annotations: nil, wantFields: []string{credentialsField, slurmField}},
+		"other runtime":         {runtime: "torch-distributed", annotations: nil},
+		"update is not checked": {runtime: Name, annotations: nil, update: true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			job := &trainer.TrainJob{
+				ObjectMeta: metav1.ObjectMeta{Annotations: tc.annotations},
+				Spec:       trainer.TrainJobSpec{RuntimeRef: trainer.RuntimeRef{Name: tc.runtime}},
+			}
+			var oldJob *trainer.TrainJob
+			if tc.update {
+				oldJob = job.DeepCopy()
+			}
+
+			_, errs := r.Validate(context.TODO(), nil, oldJob, job)
+
+			var gotFields []string
+			for _, err := range errs {
+				gotFields = append(gotFields, err.Field)
+			}
+			if diff := cmp.Diff(tc.wantFields, gotFields); len(diff) != 0 {
+				t.Errorf("Unexpected error fields (-want,+got):\n%s\nerrors: %v", diff, errs)
+			}
+		})
+	}
+}

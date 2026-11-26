@@ -118,6 +118,7 @@ func TestNew(t *testing.T) {
 					&volcano.Volcano{},
 					&jax.Jax{},
 					&xgboost.XGBoost{},
+					&remote.Remote{},
 				},
 				watchExtensionPlugins: []framework.WatchExtensionPlugin{
 					&flux.Flux{},

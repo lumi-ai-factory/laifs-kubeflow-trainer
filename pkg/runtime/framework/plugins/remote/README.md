@@ -79,7 +79,8 @@ spec:
 Each job names its credential Secret with the `credentials` annotation, and the plugin adds that Secret from the
 TrainJob's namespace to the runner. The job runs on HPC as the owner of its FirecREST credentials. A credential Secret
 belongs to one user (e.g. `lumi-jane-doe-example-org`) or to a robot account (`lumi-robot`). Only names
-starting with `lumi-` are accepted. There is no default: without the annotation the TrainJob does not start.
+starting with `lumi-` are accepted. There is no default: without a valid annotation the TrainJob is rejected
+when it is created.
 
 The Secret holds one of two FirecREST auth methods:
 
@@ -150,7 +151,9 @@ job_id = client.train(
 ## Failure Behavior
 
 - No retries: if the HPC job fails, the TrainJob fails, and the user must inspect the logs and resubmit.
-- Without the `slurm-uri` or `credentials` annotation, the TrainJob does not start (the plugin returns an error).
+- Without the `slurm-uri` annotation, or without a valid `credentials` annotation, the TrainJob webhook rejects the
+  job when it is created, so `TrainerClient().train()` fails with the reason. If the webhook is not in use, the
+  controller does not create the job and reports the reason only as a TrainJob event.
 - If the credential Secret does not exist, the runner pod does not start (`CreateContainerConfigError`).
 - Without the MLflow ConfigMap or token, the job runs without MLflow (warning in the runner log).
 

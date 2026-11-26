@@ -24,8 +24,10 @@ import (
 
 	apiruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 	jobsetv1alpha2ac "sigs.k8s.io/jobset/client-go/applyconfiguration/jobset/v1alpha2"
 
 	configapi "github.com/kubeflow/trainer/v2/pkg/apis/config/v1alpha1"
@@ -54,6 +56,7 @@ type Remote struct {
 }
 
 var _ framework.ComponentBuilderPlugin = (*Remote)(nil)
+var _ framework.CustomValidationPlugin = (*Remote)(nil)
 
 func New(_ context.Context, c client.Client, _ client.FieldIndexer, _ *configapi.Configuration) (framework.Plugin, error) {
 	return &Remote{client: c}, nil
@@ -131,6 +134,27 @@ func credentialsSecret(job *trainer.TrainJob) (string, error) {
 			CredentialsAnnotation, name, strings.Join(errs, "; "))
 	}
 	return name, nil
+}
+
+// Validate runs in the TrainJob webhook when a job is created. It rejects a remote job whose
+// required annotations are missing or invalid, so TrainerClient().train() fails right away.
+// Build checks the same, but only later in the controller, where the user does not see it.
+func (r *Remote) Validate(_ context.Context, _ *runtime.Info, oldObj, newObj *trainer.TrainJob) (admission.Warnings, field.ErrorList) {
+	// Updates are not checked: the runner adds the job-id annotation to jobs created earlier
+	if oldObj != nil || newObj == nil || newObj.Spec.RuntimeRef.Name != Name {
+		return nil, nil
+	}
+
+	annotations := field.NewPath("metadata", "annotations")
+	var errs field.ErrorList
+
+	if _, err := credentialsSecret(newObj); err != nil {
+		errs = append(errs, field.Invalid(annotations.Key(CredentialsAnnotation), newObj.Annotations[CredentialsAnnotation], err.Error()))
+	}
+	if strings.TrimSpace(newObj.Annotations[SlurmURIAnnotation]) == "" {
+		errs = append(errs, field.Required(annotations.Key(SlurmURIAnnotation), "S3 URI of the SLURM script"))
+	}
+	return nil, errs
 }
 
 // Build customizes the generated JobSet so that training is executed
